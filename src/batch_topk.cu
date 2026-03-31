@@ -92,7 +92,7 @@ cudaError_t batch_topk_half(const half* d_input,
     return status;
   }
 
-  compact_candidates_kernel<<<seg_num, 256, 0, stream>>>(
+  compact_candidate_indices_kernel<<<seg_num, 256, 0, stream>>>(
       d_input, seg_len, workspace.states, workspace.candidate_indices,
       workspace.candidate_counts);
   status = cudaGetLastError();

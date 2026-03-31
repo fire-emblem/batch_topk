@@ -315,7 +315,7 @@ bool check_optimized_workspace_layout_contract() {
     return false;
   }
   offset += static_cast<size_t>(seg_num) *
-            radix_topk::kCompactedCandidateCap * sizeof(int);
+            radix_topk::kOptimizedCandidateCap * sizeof(int);
   return offset == workspace_bytes;
 }
 
@@ -536,7 +536,7 @@ bool check_gpu_duplicate_heavy_k50() {
       }
     }
     if (candidate_counts[seg] < k ||
-        candidate_counts[seg] > radix_topk::kCompactedCandidateCap) {
+        candidate_counts[seg] > radix_topk::kOptimizedCandidateCap) {
       std::fprintf(stderr,
                    "segment %d candidate count out of range: %d\n",
                    seg,
@@ -649,6 +649,13 @@ bool check_gpu_large_random_regression() {
                      candidate_counts[seg]);
         return false;
       }
+    }
+    if (candidate_counts[seg] > radix_topk::kOptimizedCandidateCap) {
+      std::fprintf(stderr,
+                   "random segment %d candidate count too large: %d\n",
+                   seg,
+                   candidate_counts[seg]);
+      return false;
     }
   }
   return true;

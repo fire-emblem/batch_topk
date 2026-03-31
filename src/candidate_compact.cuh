@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cub/block/block_scan.cuh>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
@@ -10,7 +11,7 @@
 
 namespace radix_topk {
 
-inline constexpr int kCompactedCandidateCap = kMaxSupportedSegLen;
+inline constexpr int kCompactedCandidateCap = kOptimizedCandidateCap;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
@@ -74,38 +75,76 @@ inline CandidateCompactionWorkspaceView make_candidate_compaction_workspace(void
   return view;
 }
 
-__global__ inline void compact_candidates_kernel(const half* input,
-                                                 int seg_len,
-                                                 const SegmentSelectState* states,
-                                                 int* candidate_indices,
-                                                 int* candidate_counts) {
+__global__ inline void compact_candidate_indices_kernel(const half* input,
+                                                        int seg_len,
+                                                        const SegmentSelectState* states,
+                                                        int* candidate_indices,
+                                                        int* candidate_counts) {
+  using BlockScan = cub::BlockScan<int, 256>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ int better_written;
+  __shared__ int equal_written;
+  __shared__ int shared_better_base;
+  __shared__ int shared_equal_base;
+
   const int seg = blockIdx.x;
   const SegmentSelectState state = states[seg];
   const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
-  int* segment_candidate_indices =
+  int* segment_candidates =
       candidate_indices + static_cast<size_t>(seg) * kCompactedCandidateCap;
 
-  __shared__ int block_count;
   if (threadIdx.x == 0) {
-    block_count = 0;
+    better_written = 0;
+    equal_written = 0;
   }
   __syncthreads();
 
-  for (int i = threadIdx.x; i < seg_len; i += blockDim.x) {
-    const half value = segment_input[i];
-    const uint16_t encoded = encode_half_desc(value);
-    if ((encoded & state.prefix_mask) <= state.prefix) {
-      const int slot = atomicAdd(&block_count, 1);
-      if (slot < kCompactedCandidateCap) {
-        segment_candidate_indices[slot] = i;
+  for (int base = 0; base < seg_len; base += blockDim.x) {
+    const int idx = base + threadIdx.x;
+    const bool in_range = idx < seg_len;
+    const uint16_t key = in_range ? encode_half_desc(segment_input[idx]) : 0xffffu;
+
+    const int better_flag = in_range && key < state.cutoff_key ? 1 : 0;
+    int better_prefix = 0;
+    int better_total = 0;
+    BlockScan(scan_storage).ExclusiveSum(better_flag, better_prefix, better_total);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      shared_better_base = better_written;
+      better_written += better_total;
+    }
+    __syncthreads();
+    if (better_flag) {
+      const int better_rank = shared_better_base + better_prefix;
+      if (better_rank < kCompactedCandidateCap) {
+        segment_candidates[better_rank] = idx;
       }
     }
+    __syncthreads();
+
+    const int equal_flag = in_range && key == state.cutoff_key ? 1 : 0;
+    int equal_prefix = 0;
+    int equal_total = 0;
+    BlockScan(scan_storage).ExclusiveSum(equal_flag, equal_prefix, equal_total);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      shared_equal_base = equal_written;
+      equal_written += equal_total;
+    }
+    __syncthreads();
+    if (equal_flag) {
+      const int equal_rank = shared_equal_base + equal_prefix;
+      const int output_slot = state.strictly_better_count + equal_rank;
+      if (equal_rank < state.remaining_slots && output_slot < kCompactedCandidateCap) {
+        segment_candidates[output_slot] = idx;
+      }
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   if (threadIdx.x == 0) {
-    candidate_counts[seg] =
-        block_count < kCompactedCandidateCap ? block_count : kCompactedCandidateCap;
+    const int total = state.strictly_better_count + state.remaining_slots;
+    candidate_counts[seg] = total < kCompactedCandidateCap ? total : kCompactedCandidateCap;
   }
 }
 
