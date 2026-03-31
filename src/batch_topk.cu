@@ -16,7 +16,9 @@ cudaError_t batch_topk_half(
 }
 
 size_t batch_topk_half_workspace_size(int seg_num, int seg_len, int k) {
-  return (seg_num > 0 && seg_len > 0 && k > 0) ? 1u : 0u;
+  return (seg_num > 0 && seg_len > 0 && k > 0)
+             ? static_cast<size_t>(seg_num) * 256u
+             : 0u;
 }
 
 }  // namespace radix_topk
