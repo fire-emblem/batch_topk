@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -27,15 +28,28 @@ inline ReferenceTopKResult cpu_reference_topk(const std::vector<float>& values,
     return result;
   }
 
-  const int actual_k = std::min(k, seg_len);
-  std::vector<int> order(static_cast<size_t>(seg_len));
-  for (int i = 0; i < seg_len; ++i) {
+  const int bounded_seg_len =
+      std::min(seg_len, static_cast<int>(values.size()));
+  if (bounded_seg_len <= 0) {
+    return result;
+  }
+
+  const int actual_k = std::min(k, bounded_seg_len);
+  std::vector<int> order(static_cast<size_t>(bounded_seg_len));
+  for (int i = 0; i < bounded_seg_len; ++i) {
     order[static_cast<size_t>(i)] = i;
   }
 
   std::stable_sort(order.begin(), order.end(), [&](int lhs, int rhs) {
-    if (values[static_cast<size_t>(lhs)] != values[static_cast<size_t>(rhs)]) {
-      return values[static_cast<size_t>(lhs)] > values[static_cast<size_t>(rhs)];
+    const float lhs_value = values[static_cast<size_t>(lhs)];
+    const float rhs_value = values[static_cast<size_t>(rhs)];
+    const bool lhs_nan = std::isnan(lhs_value);
+    const bool rhs_nan = std::isnan(rhs_value);
+    if (lhs_nan != rhs_nan) {
+      return rhs_nan;
+    }
+    if (!lhs_nan && lhs_value != rhs_value) {
+      return lhs_value > rhs_value;
     }
     return lhs < rhs;
   });

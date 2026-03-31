@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -12,6 +13,25 @@ bool check_reference_ordering() {
       radix_topk::cpu_reference_topk(values, 4, 2);
   return result.indices == std::vector<int>{1, 2} &&
          result.values == std::vector<float>{7.0f, 7.0f};
+}
+
+bool check_reference_nan_ordering() {
+  const std::vector<float> values = {NAN, 3.0f, -1.0f, NAN};
+  const radix_topk::ReferenceTopKResult result =
+      radix_topk::cpu_reference_topk(values, 4, 3);
+  return result.indices == std::vector<int>{1, 2, 0} &&
+         result.values.size() == 3 &&
+         result.values[0] == 3.0f &&
+         result.values[1] == -1.0f &&
+         std::isnan(result.values[2]);
+}
+
+bool check_reference_bounded_seg_len() {
+  const std::vector<float> values = {2.0f, 1.0f};
+  const radix_topk::ReferenceTopKResult result =
+      radix_topk::cpu_reference_topk(values, 4, 4);
+  return result.indices == std::vector<int>{0, 1} &&
+         result.values == std::vector<float>{2.0f, 1.0f};
 }
 
 }  // namespace
@@ -30,6 +50,14 @@ int main() {
 
   if (!check_reference_ordering()) {
     std::fprintf(stderr, "cpu reference ordering is not deterministic\n");
+    return 1;
+  }
+  if (!check_reference_nan_ordering()) {
+    std::fprintf(stderr, "cpu reference NaN handling is incorrect\n");
+    return 1;
+  }
+  if (!check_reference_bounded_seg_len()) {
+    std::fprintf(stderr, "cpu reference seg_len clamping is incorrect\n");
     return 1;
   }
 
