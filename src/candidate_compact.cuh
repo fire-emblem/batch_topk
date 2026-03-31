@@ -10,9 +10,7 @@
 
 namespace radix_topk {
 
-// Correctness-first cap: the current supported path allows seg_len up to 10000,
-// so compaction must be able to retain the full segment when radix reduction
-// is not yet selective enough.
+// Keep legacy candidate storage cap for existing compaction/sort kernels.
 inline constexpr int kCompactedCandidateCap = 10000;
 
 inline size_t align_up(size_t value, size_t alignment) {
@@ -20,9 +18,15 @@ inline size_t align_up(size_t value, size_t alignment) {
 }
 
 struct CandidateCompactionWorkspaceView {
-  unsigned int* histograms = nullptr;
+  unsigned int* histograms_hi = nullptr;
+  unsigned int* histograms_lo = nullptr;
+  unsigned int* partial_histograms = nullptr;
   SegmentSelectState* states = nullptr;
   int* candidate_counts = nullptr;
+  int* candidate_indices = nullptr;
+
+  // Backward-compat pointers used by current kernels/callers.
+  unsigned int* histograms = nullptr;
   Candidate* candidates = nullptr;
 };
 
@@ -34,12 +38,13 @@ inline size_t candidate_compaction_workspace_bytes(int seg_num) {
   size_t offset = 0u;
   offset = align_up(offset, alignof(unsigned int));
   offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  offset += static_cast<size_t>(seg_num) * 4u * 256u * sizeof(unsigned int);
   offset = align_up(offset, alignof(SegmentSelectState));
   offset += static_cast<size_t>(seg_num) * sizeof(SegmentSelectState);
   offset = align_up(offset, alignof(int));
   offset += static_cast<size_t>(seg_num) * sizeof(int);
-  offset = align_up(offset, alignof(Candidate));
-  offset += static_cast<size_t>(seg_num) * kCompactedCandidateCap * sizeof(Candidate);
+  offset += static_cast<size_t>(seg_num) * kOptimizedCandidateCap * sizeof(int);
   return offset;
 }
 
@@ -52,9 +57,15 @@ inline CandidateCompactionWorkspaceView make_candidate_compaction_workspace(void
 
   size_t offset = 0u;
   offset = align_up(offset, alignof(unsigned int));
-  view.histograms = reinterpret_cast<unsigned int*>(
+  view.histograms_hi = reinterpret_cast<unsigned int*>(
       static_cast<std::byte*>(workspace) + offset);
   offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  view.histograms_lo = reinterpret_cast<unsigned int*>(
+      static_cast<std::byte*>(workspace) + offset);
+  offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  view.partial_histograms = reinterpret_cast<unsigned int*>(
+      static_cast<std::byte*>(workspace) + offset);
+  offset += static_cast<size_t>(seg_num) * 4u * 256u * sizeof(unsigned int);
   offset = align_up(offset, alignof(SegmentSelectState));
   view.states = reinterpret_cast<SegmentSelectState*>(
       static_cast<std::byte*>(workspace) + offset);
@@ -63,9 +74,11 @@ inline CandidateCompactionWorkspaceView make_candidate_compaction_workspace(void
   view.candidate_counts = reinterpret_cast<int*>(
       static_cast<std::byte*>(workspace) + offset);
   offset += static_cast<size_t>(seg_num) * sizeof(int);
-  offset = align_up(offset, alignof(Candidate));
-  view.candidates = reinterpret_cast<Candidate*>(
+  view.candidate_indices = reinterpret_cast<int*>(
       static_cast<std::byte*>(workspace) + offset);
+
+  view.histograms = view.histograms_hi;
+  view.candidates = nullptr;
   return view;
 }
 

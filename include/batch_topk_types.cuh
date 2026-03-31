@@ -10,6 +10,9 @@
 namespace radix_topk {
 
 inline constexpr int kMaxSupportedK = 128;
+inline constexpr int kOptimizedSegLen = 10000;
+inline constexpr int kOptimizedK = 50;
+inline constexpr int kOptimizedCandidateCap = 64;
 
 struct Candidate {
   uint32_t encoded_key = 0;
@@ -25,9 +28,12 @@ struct ReferenceTopKResult {
 struct SegmentSelectState {
   uint16_t prefix = 0;
   uint16_t prefix_mask = 0;
+  uint16_t cutoff_key = 0xffffu;
   int selected_count = 0;
   int live_count = 0;
   int boundary_digit = 0;
+  int strictly_better_count = 0;
+  int remaining_slots = 0;
 };
 
 __host__ __device__ uint16_t normalize_half_bits(uint16_t bits);

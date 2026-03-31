@@ -158,6 +158,27 @@ bool check_benchmark_target_matrix() {
   return true;
 }
 
+bool check_optimized_state_contract() {
+  radix_topk::SegmentSelectState state{};
+  state.cutoff_key = 0x1234u;
+  state.strictly_better_count = 49;
+  state.remaining_slots = 1;
+  return state.cutoff_key == 0x1234u &&
+         state.strictly_better_count == 49 &&
+         state.remaining_slots == 1;
+}
+
+bool check_optimized_workspace_contract() {
+  const size_t workspace_bytes =
+      radix_topk::batch_topk_half_workspace_size(128, 10000, 50);
+  const size_t old_full_candidate_bytes =
+      static_cast<size_t>(128) * 10000 * sizeof(radix_topk::Candidate);
+  return workspace_bytes > 0 &&
+         workspace_bytes < old_full_candidate_bytes &&
+         radix_topk::kOptimizedCandidateCap >= 50 &&
+         radix_topk::kOptimizedCandidateCap <= 64;
+}
+
 bool check_gpu_small_correctness() {
   const int seg_num = 2;
   const int seg_len = 8;
@@ -556,6 +577,14 @@ int main() {
   }
   if (!check_benchmark_target_matrix()) {
     std::fprintf(stderr, "benchmark target matrix is incorrect\n");
+    return 1;
+  }
+  if (!check_optimized_state_contract()) {
+    std::fprintf(stderr, "optimized state contract is incorrect\n");
+    return 1;
+  }
+  if (!check_optimized_workspace_contract()) {
+    std::fprintf(stderr, "optimized workspace contract is incorrect\n");
     return 1;
   }
   if (!check_gpu_small_correctness()) {
