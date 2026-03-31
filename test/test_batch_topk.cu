@@ -56,6 +56,25 @@ bool check_candidate_tie_break() {
 
 }  // namespace
 
+__global__ void codec_smoke_kernel(uint16_t* keys_out, int* better_out) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) {
+    return;
+  }
+
+  keys_out[0] = radix_topk::encode_half_desc(__float2half(-1.0f));
+  keys_out[1] = radix_topk::encode_half_desc(__float2half(3.0f));
+
+  radix_topk::Candidate lhs{};
+  lhs.value = __float2half(5.0f);
+  lhs.index = 2;
+
+  radix_topk::Candidate rhs{};
+  rhs.value = __float2half(5.0f);
+  rhs.index = 1;
+
+  better_out[0] = radix_topk::candidate_better(rhs, lhs) ? 1 : 0;
+}
+
 int main() {
   const radix_topk::Candidate candidate{};
   (void)candidate;
@@ -86,6 +105,39 @@ int main() {
   }
   if (!check_candidate_tie_break()) {
     std::fprintf(stderr, "candidate tie break is incorrect\n");
+    return 1;
+  }
+
+  uint16_t host_keys[2] = {};
+  int host_better = 0;
+  uint16_t* d_keys = nullptr;
+  int* d_better = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_keys), sizeof(host_keys)) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_better), sizeof(host_better)) != cudaSuccess) {
+    std::fprintf(stderr, "cudaMalloc failed in codec smoke path\n");
+    cudaFree(d_better);
+    cudaFree(d_keys);
+    return 1;
+  }
+  codec_smoke_kernel<<<1, 1>>>(d_keys, d_better);
+  if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
+      cudaMemcpy(host_keys, d_keys, sizeof(host_keys), cudaMemcpyDeviceToHost) !=
+          cudaSuccess ||
+      cudaMemcpy(&host_better, d_better, sizeof(host_better), cudaMemcpyDeviceToHost) !=
+          cudaSuccess) {
+    std::fprintf(stderr, "device codec smoke path failed\n");
+    cudaFree(d_better);
+    cudaFree(d_keys);
+    return 1;
+  }
+  if (!(host_keys[1] < host_keys[0]) || host_better != 1) {
+    std::fprintf(stderr, "device codec semantics are incorrect\n");
+    cudaFree(d_better);
+    cudaFree(d_keys);
+    return 1;
+  }
+  if (cudaFree(d_better) != cudaSuccess || cudaFree(d_keys) != cudaSuccess) {
+    std::fprintf(stderr, "cudaFree failed in codec smoke path\n");
     return 1;
   }
 
