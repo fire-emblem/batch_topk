@@ -533,6 +533,9 @@ bool run_random_gpu_case(int seg_num, int seg_len, int k, uint32_t seed) {
       0);
   std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
   std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  std::vector<int> candidate_counts(seg_num, 0);
+  const auto workspace_view =
+      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
   const bool ok = status == cudaSuccess &&
                   cudaDeviceSynchronize() == cudaSuccess &&
                   cudaMemcpy(output_values.data(),
@@ -542,6 +545,10 @@ bool run_random_gpu_case(int seg_num, int seg_len, int k, uint32_t seed) {
                   cudaMemcpy(output_indices.data(),
                              d_output_indices,
                              sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(candidate_counts.data(),
+                             workspace_view.candidate_counts,
+                             sizeof(int) * candidate_counts.size(),
                              cudaMemcpyDeviceToHost) == cudaSuccess;
   cudaFree(d_workspace);
   cudaFree(d_output_indices);
@@ -743,6 +750,9 @@ bool check_gpu_optimized_nan_inf_regression() {
       0);
   std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
   std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  std::vector<int> candidate_counts(seg_num, 0);
+  const auto workspace_view =
+      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
   const bool ok = status == cudaSuccess &&
                   cudaDeviceSynchronize() == cudaSuccess &&
                   cudaMemcpy(output_values.data(),
@@ -752,6 +762,10 @@ bool check_gpu_optimized_nan_inf_regression() {
                   cudaMemcpy(output_indices.data(),
                              d_output_indices,
                              sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(candidate_counts.data(),
+                             workspace_view.candidate_counts,
+                             sizeof(int) * candidate_counts.size(),
                              cudaMemcpyDeviceToHost) == cudaSuccess;
   cudaFree(d_workspace);
   cudaFree(d_output_indices);
@@ -782,6 +796,14 @@ bool check_gpu_optimized_nan_inf_regression() {
                      expected.values[i]);
         return false;
       }
+    }
+    if (candidate_counts[seg] != k) {
+      std::fprintf(stderr,
+                   "optimized NaN/Inf segment %d candidate count must equal k (%d), got %d\n",
+                   seg,
+                   k,
+                   candidate_counts[seg]);
+      return false;
     }
   }
   return true;
