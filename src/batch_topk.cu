@@ -1,7 +1,9 @@
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
 #include "candidate_compact.cuh"
+#include "dispatch_policy.cuh"
 #include "final_block_sort.cuh"
+#include "final_topk50.cuh"
 #include "radix_boundary_select.cuh"
 #include "radix_histogram.cuh"
 #include "radix_select_state.cuh"
@@ -59,14 +61,88 @@ cudaError_t batch_topk_half(const half* d_input,
 
   const CandidateCompactionWorkspaceView workspace =
       make_candidate_compaction_workspace(d_workspace, seg_num);
-  if (!workspace.histograms_hi || !workspace.histograms_lo || !workspace.states ||
-      !workspace.candidate_counts || !workspace.candidate_indices) {
+  if (!workspace.histograms_hi || !workspace.histograms_lo ||
+      !workspace.partial_histograms || !workspace.states || !workspace.candidate_counts ||
+      !workspace.candidate_indices) {
     return cudaErrorInvalidValue;
+  }
+
+  cudaError_t status = cudaSuccess;
+  if (seg_len == kOptimizedSegLen && k == kOptimizedK) {
+    const int ctas_per_segment = histogram_ctas_per_segment(seg_num);
+
+    if (ctas_per_segment == 1) {
+      histogram_high_byte_kernel<<<seg_num, 256, 0, stream>>>(
+          d_input, seg_len, workspace.histograms_hi);
+    } else {
+      histogram_high_byte_splitk_kernel<<<seg_num * ctas_per_segment, 256, 0, stream>>>(
+          d_input, seg_num, seg_len, ctas_per_segment, workspace.partial_histograms);
+      status = cudaGetLastError();
+      if (status != cudaSuccess) {
+        return status;
+      }
+      reduce_partial_histograms_kernel<<<seg_num, 256, 0, stream>>>(
+          workspace.partial_histograms, seg_num, ctas_per_segment, workspace.histograms_hi);
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    select_high_byte_boundary_kernel<<<(seg_num + 127) / 128, 128, 0, stream>>>(
+        workspace.histograms_hi, seg_num, k, workspace.states);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    if (ctas_per_segment == 1) {
+      histogram_low_byte_kernel<<<seg_num, 256, 0, stream>>>(
+          d_input, seg_len, workspace.states, workspace.histograms_lo);
+    } else {
+      histogram_low_byte_splitk_kernel<<<seg_num * ctas_per_segment, 256, 0, stream>>>(
+          d_input,
+          seg_num,
+          seg_len,
+          ctas_per_segment,
+          workspace.states,
+          workspace.partial_histograms);
+      status = cudaGetLastError();
+      if (status != cudaSuccess) {
+        return status;
+      }
+      reduce_partial_histograms_kernel<<<seg_num, 256, 0, stream>>>(
+          workspace.partial_histograms, seg_num, ctas_per_segment, workspace.histograms_lo);
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    finalize_cutoff_key_kernel<<<(seg_num + 127) / 128, 128, 0, stream>>>(
+        workspace.histograms_lo, seg_num, k, workspace.states);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    compact_candidate_indices_kernel<<<seg_num, 256, 0, stream>>>(
+        d_input, seg_len, workspace.states, workspace.candidate_indices,
+        workspace.candidate_counts);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    final_topk50_kernel<<<seg_num, kOptimizedCandidateCap, 0, stream>>>(
+        d_input, seg_len, workspace.candidate_indices, workspace.candidate_counts,
+        d_output_values, d_output_indices);
+    return cudaGetLastError();
   }
 
   histogram_high_byte_kernel<<<seg_num, 256, 0, stream>>>(
       d_input, seg_len, workspace.histograms_hi);
-  cudaError_t status = cudaGetLastError();
+  status = cudaGetLastError();
   if (status != cudaSuccess) {
     return status;
   }

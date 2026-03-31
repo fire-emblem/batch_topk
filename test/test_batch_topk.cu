@@ -8,6 +8,7 @@
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
 #include "../src/candidate_compact.cuh"
+#include "../src/dispatch_policy.cuh"
 #include "../src/radix_boundary_select.cuh"
 #include "../src/radix_histogram.cuh"
 #include "../src/radix_select_state.cuh"
@@ -415,6 +416,13 @@ bool check_gpu_small_correctness() {
   return true;
 }
 
+bool check_dispatch_policy() {
+  return radix_topk::histogram_ctas_per_segment(1) == 4 &&
+         radix_topk::histogram_ctas_per_segment(8) == 4 &&
+         radix_topk::histogram_ctas_per_segment(32) == 2 &&
+         radix_topk::histogram_ctas_per_segment(128) == 1;
+}
+
 std::vector<float> make_random_input(int seg_num, int seg_len, uint32_t seed) {
   std::mt19937 rng(seed);
   std::uniform_real_distribution<float> dist(-64.0f, 64.0f);
@@ -440,6 +448,91 @@ std::vector<float> make_duplicate_heavy_input(int seg_num, int seg_len) {
     }
   }
   return values;
+}
+
+bool run_random_gpu_case(int seg_num, int seg_len, int k, uint32_t seed) {
+  const std::vector<float> host_values = make_random_input(seg_num, seg_len, seed);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  const size_t workspace_size =
+      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
+  half* d_input = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  void* d_workspace = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  const cudaError_t status = radix_topk::batch_topk_half(
+      d_input,
+      seg_num,
+      seg_len,
+      k,
+      d_output_values,
+      d_output_indices,
+      d_workspace,
+      workspace_size,
+      0);
+  std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
+  std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  const bool ok = status == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(output_values.data(),
+                             d_output_values,
+                             sizeof(half) * output_values.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(output_indices.data(),
+                             d_output_indices,
+                             sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_workspace);
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_input);
+  if (!ok) {
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
+    const auto end = begin + seg_len;
+    const std::vector<float> segment(begin, end);
+    const radix_topk::ReferenceTopKResult expected =
+        radix_topk::cpu_reference_topk(segment, seg_len, k);
+    for (int i = 0; i < k; ++i) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool check_gpu_small_batch_shapes() {
+  return run_random_gpu_case(1, 10000, 50, 7u) &&
+         run_random_gpu_case(8, 10000, 50, 17u) &&
+         run_random_gpu_case(32, 10000, 50, 23u);
 }
 
 bool check_gpu_k128_correctness() {
@@ -855,6 +948,14 @@ int main() {
   }
   if (!check_gpu_small_correctness()) {
     std::fprintf(stderr, "gpu small correctness check failed\n");
+    return 1;
+  }
+  if (!check_dispatch_policy()) {
+    std::fprintf(stderr, "dispatch policy is incorrect\n");
+    return 1;
+  }
+  if (!check_gpu_small_batch_shapes()) {
+    std::fprintf(stderr, "gpu small batch shape check failed\n");
     return 1;
   }
   if (!check_gpu_k128_correctness()) {
