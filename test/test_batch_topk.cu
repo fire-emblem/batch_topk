@@ -61,13 +61,16 @@ bool check_radix_boundary_state() {
                                      5.0f, 4.0f, 3.0f, 2.0f};
   const radix_topk::SegmentSelectState state =
       radix_topk::simulate_radix_boundary(values, 8, 3);
-  return state.selected_count == 2 && state.live_count > 0 &&
-         state.boundary_digit >= 0;
+  return state.selected_count == 2 && state.live_count == 1 &&
+         state.boundary_digit == 56 && state.prefix == 0x3800u &&
+         state.prefix_mask == 0xff00u;
 }
 
-bool check_histogram_pass() {
-  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
-                                     5.0f, 4.0f, 3.0f, 2.0f};
+bool run_histogram_pass(const std::vector<float>& values,
+                        uint16_t prefix,
+                        uint16_t prefix_mask,
+                        int shift,
+                        std::vector<unsigned int>* histograms) {
   std::vector<half> host_input(values.size());
   for (size_t i = 0; i < values.size(); ++i) {
     host_input[i] = __float2half(values[i]);
@@ -88,25 +91,51 @@ bool check_histogram_pass() {
     return false;
   }
 
-  radix_topk::histogram_pass_kernel<<<1, 256>>>(d_input, 8, 8, d_histograms);
-  std::vector<unsigned int> histograms(256, 0);
+  radix_topk::histogram_pass_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), shift, prefix, prefix_mask,
+      d_histograms);
   const bool ok = cudaGetLastError() == cudaSuccess &&
                   cudaDeviceSynchronize() == cudaSuccess &&
-                  cudaMemcpy(histograms.data(),
+                  cudaMemcpy(histograms->data(),
                              d_histograms,
-                             sizeof(unsigned int) * histograms.size(),
+                             sizeof(unsigned int) * histograms->size(),
                              cudaMemcpyDeviceToHost) == cudaSuccess;
   cudaFree(d_histograms);
   cudaFree(d_input);
-  if (!ok) {
+  return ok;
+}
+
+bool check_histogram_pass() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  const radix_topk::SegmentSelectState state =
+      radix_topk::simulate_radix_boundary(values, 8, 3);
+  std::vector<unsigned int> histograms(256, 0);
+  if (!run_histogram_pass(values, 0, 0, 8, &histograms)) {
     return false;
   }
 
-  unsigned int sum = 0;
-  for (unsigned int count : histograms) {
-    sum += count;
+  if (histograms[55] != 2 || histograms[56] != 1 || histograms[57] != 1 ||
+      histograms[58] != 1 || histograms[59] != 1 || histograms[61] != 1 ||
+      histograms[63] != 1) {
+    return false;
   }
-  return sum == values.size();
+
+  std::vector<unsigned int> filtered_histograms(256, 0);
+  if (!run_histogram_pass(values, state.prefix, state.prefix_mask, 0,
+                          &filtered_histograms)) {
+    return false;
+  }
+
+  if (filtered_histograms[255] != 1) {
+    return false;
+  }
+  for (int i = 0; i < 255; ++i) {
+    if (filtered_histograms[static_cast<size_t>(i)] != 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool check_gpu_small_correctness() {

@@ -42,7 +42,7 @@ inline SegmentSelectState simulate_radix_boundary(const std::vector<float>& valu
     break;
   }
 
-  state.prefix = 0;
+  state.prefix = static_cast<uint16_t>(boundary_digit << 8);
   state.prefix_mask = 0xff00u;
   state.selected_count = selected_count;
   state.live_count = live_count;
