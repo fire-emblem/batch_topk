@@ -250,6 +250,11 @@ bool check_benchmark_target_matrix() {
   return true;
 }
 
+bool check_benchmark_measurement_contract() {
+  return radix_topk::kPrimaryBenchmarkCases[0].seg_num == 128 &&
+         radix_topk::kPrimaryBenchmarkCases[4].seg_num == 6000;
+}
+
 bool check_optimized_state_contract() {
   radix_topk::SegmentSelectState state{};
   return state.prefix == 0u &&
@@ -1198,6 +1203,10 @@ int main() {
   }
   if (!check_benchmark_target_matrix()) {
     std::fprintf(stderr, "benchmark target matrix is incorrect\n");
+    return 1;
+  }
+  if (!check_benchmark_measurement_contract()) {
+    std::fprintf(stderr, "benchmark measurement contract is incorrect\n");
     return 1;
   }
   if (!check_optimized_state_contract()) {
