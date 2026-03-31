@@ -145,8 +145,54 @@ __global__ inline void compact_candidate_indices_kernel(const half* input,
   }
 
   if (threadIdx.x == 0) {
-    const int total = state.strictly_better_count + state.remaining_slots;
-    candidate_counts[seg] = total < kCompactedCandidateCap ? total : kCompactedCandidateCap;
+    int better_slots = better_written;
+    if (better_slots < 0) {
+      better_slots = 0;
+    }
+    if (better_slots > kCompactedCandidateCap) {
+      better_slots = kCompactedCandidateCap;
+    }
+
+    int equal_capacity_from_state = kCompactedCandidateCap - state.strictly_better_count;
+    if (equal_capacity_from_state < 0) {
+      equal_capacity_from_state = 0;
+    }
+    int equal_limit = state.remaining_slots;
+    if (equal_limit < 0) {
+      equal_limit = 0;
+    }
+    if (equal_limit > equal_capacity_from_state) {
+      equal_limit = equal_capacity_from_state;
+    }
+
+    int equal_slots = equal_written;
+    if (equal_slots < 0) {
+      equal_slots = 0;
+    }
+    if (equal_slots > equal_limit) {
+      equal_slots = equal_limit;
+    }
+
+    // Report only the contiguous initialized prefix that final sort can safely read.
+    int safe_prefix = better_slots;
+    int equal_start = state.strictly_better_count;
+    if (equal_start < 0) {
+      equal_start = 0;
+    }
+    if (equal_start > kCompactedCandidateCap) {
+      equal_start = kCompactedCandidateCap;
+    }
+    if (equal_start <= safe_prefix) {
+      int equal_end = equal_start + equal_slots;
+      if (equal_end > kCompactedCandidateCap) {
+        equal_end = kCompactedCandidateCap;
+      }
+      if (equal_end > safe_prefix) {
+        safe_prefix = equal_end;
+      }
+    }
+
+    candidate_counts[seg] = safe_prefix;
   }
 }
 
