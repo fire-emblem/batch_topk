@@ -8,6 +8,7 @@
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
 #include "../src/candidate_compact.cuh"
+#include "../src/radix_boundary_select.cuh"
 #include "../src/radix_histogram.cuh"
 #include "../src/radix_select_state.cuh"
 
@@ -107,6 +108,67 @@ bool run_histogram_pass(const std::vector<float>& values,
   cudaFree(d_histograms);
   cudaFree(d_input);
   return ok;
+}
+
+bool run_gpu_cutoff_selection(const std::vector<float>& values,
+                              int k,
+                              radix_topk::SegmentSelectState* state_out) {
+  std::vector<half> host_input(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    host_input[i] = __float2half(values[i]);
+  }
+
+  half* d_input = nullptr;
+  unsigned int* d_hist_hi = nullptr;
+  unsigned int* d_hist_lo = nullptr;
+  radix_topk::SegmentSelectState* d_state = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_hist_hi), sizeof(unsigned int) * 256) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_hist_lo), sizeof(unsigned int) * 256) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_state), sizeof(radix_topk::SegmentSelectState)) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_state);
+    cudaFree(d_hist_lo);
+    cudaFree(d_hist_hi);
+    cudaFree(d_input);
+    return false;
+  }
+
+  radix_topk::histogram_high_byte_kernel<<<1, 256>>>(d_input, static_cast<int>(values.size()), d_hist_hi);
+  radix_topk::select_high_byte_boundary_kernel<<<1, 1>>>(d_hist_hi, 1, k, d_state);
+  radix_topk::histogram_low_byte_kernel<<<1, 256>>>(d_input, static_cast<int>(values.size()), d_state, d_hist_lo);
+  radix_topk::finalize_cutoff_key_kernel<<<1, 1>>>(d_hist_lo, 1, k, d_state);
+
+  const bool ok = cudaGetLastError() == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(state_out,
+                             d_state,
+                             sizeof(radix_topk::SegmentSelectState),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_state);
+  cudaFree(d_hist_lo);
+  cudaFree(d_hist_hi);
+  cudaFree(d_input);
+  return ok;
+}
+
+bool check_gpu_cutoff_selection() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  const uint16_t expected_cutoff =
+      radix_topk::encode_half_desc(__float2half(7.0f));
+
+  radix_topk::SegmentSelectState state{};
+  if (!run_gpu_cutoff_selection(values, 3, &state)) {
+    return false;
+  }
+
+  return state.strictly_better_count == 2 &&
+         state.remaining_slots == 1 &&
+         state.cutoff_key == expected_cutoff;
 }
 
 bool check_histogram_pass() {
@@ -640,6 +702,10 @@ int main() {
   }
   if (!check_optimized_workspace_layout_contract()) {
     std::fprintf(stderr, "optimized workspace layout contract is incorrect\n");
+    return 1;
+  }
+  if (!check_gpu_cutoff_selection()) {
+    std::fprintf(stderr, "gpu cutoff selection check failed\n");
     return 1;
   }
   if (!check_gpu_small_correctness()) {
