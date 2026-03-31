@@ -1,13 +1,35 @@
 #include <cstdio>
+#include <vector>
 
 #include "batch_topk.cuh"
+#include "batch_topk_types.cuh"
+
+namespace {
+
+bool check_reference_ordering() {
+  const std::vector<float> values = {5.0f, 7.0f, 7.0f, 1.0f};
+  const radix_topk::ReferenceTopKResult result =
+      radix_topk::cpu_reference_topk(values, 4, 2);
+  return result.indices == std::vector<int>{1, 2} &&
+         result.values == std::vector<float>{7.0f, 7.0f};
+}
+
+}  // namespace
 
 int main() {
+  const radix_topk::Candidate candidate{};
+  (void)candidate;
+
   if (radix_topk::batch_topk_half_workspace_size(0, 10000, 50) != 0 ||
       radix_topk::batch_topk_half_workspace_size(1, 10001, 50) != 0 ||
       radix_topk::batch_topk_half_workspace_size(1, 10000, 129) != 0 ||
       radix_topk::batch_topk_half_workspace_size(1, 10, 11) != 0) {
     std::fprintf(stderr, "unexpected workspace size for invalid shapes\n");
+    return 1;
+  }
+
+  if (!check_reference_ordering()) {
+    std::fprintf(stderr, "cpu reference ordering is not deterministic\n");
     return 1;
   }
 
@@ -18,6 +40,10 @@ int main() {
       radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
   if (workspace_size == 0) {
     std::fprintf(stderr, "workspace size must be nonzero for valid shapes\n");
+    return 1;
+  }
+  if (workspace_size <= 1) {
+    std::fprintf(stderr, "workspace size must support an insufficient-workspace check\n");
     return 1;
   }
 
@@ -57,6 +83,17 @@ int main() {
           radix_topk::batch_topk_half_workspace_size(1, 10, 11), 0) !=
           cudaErrorInvalidValue) {
     std::fprintf(stderr, "invalid-argument validation failed in test smoke path\n");
+    cudaFree(d_workspace);
+    cudaFree(d_indices);
+    cudaFree(d_values);
+    cudaFree(d_input);
+    return 1;
+  }
+
+  if (radix_topk::batch_topk_half(
+          d_input, seg_num, seg_len, k, d_values, d_indices, d_workspace,
+          workspace_size - 1, 0) != cudaErrorInvalidValue) {
+    std::fprintf(stderr, "insufficient workspace validation failed\n");
     cudaFree(d_workspace);
     cudaFree(d_indices);
     cudaFree(d_values);
