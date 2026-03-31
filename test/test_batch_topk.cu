@@ -139,19 +139,19 @@ bool run_gpu_cutoff_selection(const std::vector<float>& values,
 
   radix_topk::histogram_high_byte_kernel<<<1, 256>>>(
       d_input, static_cast<int>(values.size()), d_hist_hi);
-  const bool launch_ok_hi = cudaPeekAtLastError() == cudaSuccess;
+  const cudaError_t launch_status_hi = cudaGetLastError();
   radix_topk::select_high_byte_boundary_kernel<<<1, 128>>>(d_hist_hi, 1, k, d_state);
-  const bool launch_ok_select = cudaPeekAtLastError() == cudaSuccess;
+  const cudaError_t launch_status_select = cudaGetLastError();
   radix_topk::histogram_low_byte_kernel<<<1, 256>>>(
       d_input, static_cast<int>(values.size()), d_state, d_hist_lo);
-  const bool launch_ok_lo = cudaPeekAtLastError() == cudaSuccess;
+  const cudaError_t launch_status_lo = cudaGetLastError();
   radix_topk::finalize_cutoff_key_kernel<<<1, 128>>>(d_hist_lo, 1, k, d_state);
-  const bool launch_ok_finalize = cudaPeekAtLastError() == cudaSuccess;
+  const cudaError_t launch_status_finalize = cudaGetLastError();
 
-  const bool ok = launch_ok_hi &&
-                  launch_ok_select &&
-                  launch_ok_lo &&
-                  launch_ok_finalize &&
+  const bool ok = launch_status_hi == cudaSuccess &&
+                  launch_status_select == cudaSuccess &&
+                  launch_status_lo == cudaSuccess &&
+                  launch_status_finalize == cudaSuccess &&
                   cudaDeviceSynchronize() == cudaSuccess &&
                   cudaMemcpy(state_out,
                              d_state,
@@ -180,6 +180,8 @@ bool check_gpu_cutoff_selection() {
          state.cutoff_key == expected_cutoff;
 }
 
+// Defensive unit-level check: this intentionally uses k > seg_len to force the
+// sentinel fallback path in boundary selection kernels.
 bool check_gpu_cutoff_selection_fallback() {
   const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
                                      5.0f, 4.0f, 3.0f, 2.0f};
