@@ -245,13 +245,18 @@ int main() {
   half* d_values = nullptr;
   int* d_indices = nullptr;
   void* d_workspace = nullptr;
+  std::vector<half> smoke_input(static_cast<size_t>(seg_len), __float2half(0.0f));
   if (cudaMalloc(reinterpret_cast<void**>(&d_input),
                  sizeof(half) * static_cast<size_t>(seg_len)) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&d_values),
                  sizeof(half) * static_cast<size_t>(k)) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&d_indices),
                  sizeof(int) * static_cast<size_t>(k)) != cudaSuccess ||
-      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess) {
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 smoke_input.data(),
+                 sizeof(half) * smoke_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
     std::fprintf(stderr, "cudaMalloc failed in test smoke path\n");
     cudaFree(d_workspace);
     cudaFree(d_indices);

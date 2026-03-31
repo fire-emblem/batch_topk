@@ -6,7 +6,7 @@ namespace radix_topk {
 
 static bool is_supported_shape(int seg_num, int seg_len, int k) {
   return seg_num > 0 && seg_len > 0 && seg_len <= 10000 && k > 0 &&
-         k <= 128 && k <= seg_len;
+         k <= kMaxSupportedK && k <= seg_len;
 }
 
 static bool has_valid_arguments(const half* d_input,

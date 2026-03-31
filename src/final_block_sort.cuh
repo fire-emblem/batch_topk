@@ -4,6 +4,8 @@
 
 namespace radix_topk {
 
+static_assert(kMaxSupportedK == 128, "direct baseline kernel expects 128-slot storage");
+
 __device__ inline void insert_candidate_sorted(Candidate* topk,
                                                int& count,
                                                int k,
@@ -49,7 +51,7 @@ __global__ inline void direct_segment_topk_kernel(const half* input,
   half* segment_values = output_values + static_cast<size_t>(seg) * k;
   int* segment_indices = output_indices + static_cast<size_t>(seg) * k;
 
-  Candidate topk[128];
+  Candidate topk[kMaxSupportedK];
   int count = 0;
   for (int i = 0; i < seg_len; ++i) {
     Candidate candidate{};

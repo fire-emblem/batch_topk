@@ -9,6 +9,8 @@
 
 namespace radix_topk {
 
+inline constexpr int kMaxSupportedK = 128;
+
 struct Candidate {
   uint32_t encoded_key = 0;
   half value = __float2half(0.0f);
