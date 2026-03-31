@@ -21,6 +21,19 @@ Target benchmark shapes:
 - `(4500, 10000) -> (4500, 50)`
 - `(6000, 10000) -> (6000, 50)`
 
+Reference latency targets in microseconds for the above shapes:
+
+- `(128, 10000), k = 50`: `11 us`
+- `(1500, 10000), k = 50`: `82 us`
+- `(3000, 10000), k = 50`: `161 us`
+- `(4500, 10000), k = 50`: `241 us`
+- `(6000, 10000), k = 50`: `319 us`
+
+Performance goal:
+
+- Match and then exceed the above reference latencies on RTX 4080-class comparison runs
+- Treat these numbers as first-class optimization targets during implementation
+
 ## Non-Goals
 
 - Variable-length segments in the first version
@@ -328,6 +341,12 @@ Metrics:
 - Effective throughput in elements per second
 - Workspace bytes
 
+Acceptance target for the primary benchmark set:
+
+- The implementation must explicitly track the five reference latency targets
+- Success means reaching parity first and then tuning beyond the reference numbers
+- Benchmark reports should include both absolute latency and delta versus the reference targets
+
 Comparison baselines:
 
 - CPU reference for correctness only
@@ -377,6 +396,7 @@ The first version should keep these internal and choose defaults based on measur
 - Benchmark-driven tuning for the target shapes
 - Improve occupancy and memory traffic
 - Tune specifically for `k = 50`
+- Track progress against the `11 / 82 / 161 / 241 / 319 us` reference targets
 
 ## Risks
 
