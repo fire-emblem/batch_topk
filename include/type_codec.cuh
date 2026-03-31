@@ -37,19 +37,4 @@ __host__ __device__ inline uint16_t encode_half_desc(half value) {
   return static_cast<uint16_t>(~encode_half_asc(value));
 }
 
-__host__ __device__ inline bool candidate_better(const Candidate& lhs,
-                                                 const Candidate& rhs) {
-  const float lhs_value = __half2float(lhs.value);
-  const float rhs_value = __half2float(rhs.value);
-  const bool lhs_nan = is_nan_value(lhs_value);
-  const bool rhs_nan = is_nan_value(rhs_value);
-  if (lhs_nan != rhs_nan) {
-    return rhs_nan;
-  }
-  if (!lhs_nan && lhs_value != rhs_value) {
-    return lhs_value > rhs_value;
-  }
-  return lhs.index < rhs.index;
-}
-
 }  // namespace radix_topk

@@ -1,3 +1,3 @@
 #pragma once
 
-#include "type_codec.cuh"
+#include "../include/type_codec.cuh"

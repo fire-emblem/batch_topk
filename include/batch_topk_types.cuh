@@ -23,9 +23,6 @@ struct ReferenceTopKResult {
 __host__ __device__ uint16_t normalize_half_bits(uint16_t bits);
 __host__ __device__ uint16_t encode_half_asc(half value);
 __host__ __device__ uint16_t encode_half_desc(half value);
-__host__ __device__ bool candidate_better(const Candidate& lhs,
-                                          const Candidate& rhs);
-
 inline ReferenceTopKResult cpu_reference_topk(const std::vector<float>& values,
                                               int seg_len,
                                               int k) {
@@ -73,3 +70,22 @@ inline ReferenceTopKResult cpu_reference_topk(const std::vector<float>& values,
 }  // namespace radix_topk
 
 #include "type_codec.cuh"
+
+namespace radix_topk {
+
+__host__ __device__ inline bool candidate_better(const Candidate& lhs,
+                                                 const Candidate& rhs) {
+  const float lhs_value = __half2float(lhs.value);
+  const float rhs_value = __half2float(rhs.value);
+  const bool lhs_nan = is_nan_value(lhs_value);
+  const bool rhs_nan = is_nan_value(rhs_value);
+  if (lhs_nan != rhs_nan) {
+    return rhs_nan;
+  }
+  if (!lhs_nan && lhs_value != rhs_value) {
+    return lhs_value > rhs_value;
+  }
+  return lhs.index < rhs.index;
+}
+
+}  // namespace radix_topk
