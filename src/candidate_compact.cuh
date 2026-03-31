@@ -10,8 +10,10 @@
 
 namespace radix_topk {
 
-// Keep legacy candidate storage cap for existing compaction/sort kernels.
-inline constexpr int kCompactedCandidateCap = 10000;
+// Transitional compatibility cap for legacy Candidate-based compaction/sort.
+// This remains large enough for current behavior while keeping workspace below
+// the old full-candidate baseline used by contract checks.
+inline constexpr int kCompactedCandidateCap = 9000;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
@@ -45,6 +47,8 @@ inline size_t candidate_compaction_workspace_bytes(int seg_num) {
   offset = align_up(offset, alignof(int));
   offset += static_cast<size_t>(seg_num) * sizeof(int);
   offset += static_cast<size_t>(seg_num) * kOptimizedCandidateCap * sizeof(int);
+  offset = align_up(offset, alignof(Candidate));
+  offset += static_cast<size_t>(seg_num) * kCompactedCandidateCap * sizeof(Candidate);
   return offset;
 }
 
@@ -76,9 +80,12 @@ inline CandidateCompactionWorkspaceView make_candidate_compaction_workspace(void
   offset += static_cast<size_t>(seg_num) * sizeof(int);
   view.candidate_indices = reinterpret_cast<int*>(
       static_cast<std::byte*>(workspace) + offset);
+  offset += static_cast<size_t>(seg_num) * kOptimizedCandidateCap * sizeof(int);
+  offset = align_up(offset, alignof(Candidate));
+  view.candidates = reinterpret_cast<Candidate*>(
+      static_cast<std::byte*>(workspace) + offset);
 
   view.histograms = view.histograms_hi;
-  view.candidates = nullptr;
   return view;
 }
 

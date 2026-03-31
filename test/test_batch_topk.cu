@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -160,12 +161,14 @@ bool check_benchmark_target_matrix() {
 
 bool check_optimized_state_contract() {
   radix_topk::SegmentSelectState state{};
-  state.cutoff_key = 0x1234u;
-  state.strictly_better_count = 49;
-  state.remaining_slots = 1;
-  return state.cutoff_key == 0x1234u &&
-         state.strictly_better_count == 49 &&
-         state.remaining_slots == 1;
+  return state.prefix == 0u &&
+         state.prefix_mask == 0u &&
+         state.cutoff_key == 0xffffu &&
+         state.selected_count == 0 &&
+         state.live_count == 0 &&
+         state.boundary_digit == 0 &&
+         state.strictly_better_count == 0 &&
+         state.remaining_slots == 0;
 }
 
 bool check_optimized_workspace_contract() {
@@ -175,8 +178,65 @@ bool check_optimized_workspace_contract() {
       static_cast<size_t>(128) * 10000 * sizeof(radix_topk::Candidate);
   return workspace_bytes > 0 &&
          workspace_bytes < old_full_candidate_bytes &&
-         radix_topk::kOptimizedCandidateCap >= 50 &&
-         radix_topk::kOptimizedCandidateCap <= 64;
+         radix_topk::kOptimizedCandidateCap == 64;
+}
+
+bool check_optimized_workspace_layout_contract() {
+  const int seg_num = 3;
+  const size_t workspace_bytes =
+      radix_topk::candidate_compaction_workspace_bytes(seg_num);
+  if (workspace_bytes == 0) {
+    return false;
+  }
+  std::vector<std::byte> storage(workspace_bytes);
+  const auto view =
+      radix_topk::make_candidate_compaction_workspace(storage.data(), seg_num);
+  if (!view.histograms_hi || !view.histograms_lo || !view.partial_histograms ||
+      !view.states || !view.candidate_counts || !view.candidate_indices ||
+      !view.histograms || !view.candidates) {
+    return false;
+  }
+  if (view.histograms != view.histograms_hi) {
+    return false;
+  }
+
+  const auto* const base = storage.data();
+  size_t offset = 0u;
+  offset = radix_topk::align_up(offset, alignof(unsigned int));
+  if (reinterpret_cast<std::byte*>(view.histograms_hi) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  if (reinterpret_cast<std::byte*>(view.histograms_lo) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  if (reinterpret_cast<std::byte*>(view.partial_histograms) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * 4u * 256u * sizeof(unsigned int);
+  offset = radix_topk::align_up(offset, alignof(radix_topk::SegmentSelectState));
+  if (reinterpret_cast<std::byte*>(view.states) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * sizeof(radix_topk::SegmentSelectState);
+  offset = radix_topk::align_up(offset, alignof(int));
+  if (reinterpret_cast<std::byte*>(view.candidate_counts) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * sizeof(int);
+  if (reinterpret_cast<std::byte*>(view.candidate_indices) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) *
+            radix_topk::kOptimizedCandidateCap * sizeof(int);
+  offset = radix_topk::align_up(offset, alignof(radix_topk::Candidate));
+  if (reinterpret_cast<std::byte*>(view.candidates) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) *
+            radix_topk::kCompactedCandidateCap * sizeof(radix_topk::Candidate);
+  return offset == workspace_bytes;
 }
 
 bool check_gpu_small_correctness() {
@@ -585,6 +645,10 @@ int main() {
   }
   if (!check_optimized_workspace_contract()) {
     std::fprintf(stderr, "optimized workspace contract is incorrect\n");
+    return 1;
+  }
+  if (!check_optimized_workspace_layout_contract()) {
+    std::fprintf(stderr, "optimized workspace layout contract is incorrect\n");
     return 1;
   }
   if (!check_gpu_small_correctness()) {
