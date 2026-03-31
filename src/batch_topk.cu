@@ -15,8 +15,8 @@ cudaError_t batch_topk_half(
   return cudaErrorNotSupported;
 }
 
-size_t batch_topk_half_workspace_size(int, int, int) {
-  return 0;
+size_t batch_topk_half_workspace_size(int seg_num, int seg_len, int k) {
+  return (seg_num > 0 && seg_len > 0 && k > 0) ? 1u : 0u;
 }
 
 }  // namespace radix_topk
