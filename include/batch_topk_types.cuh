@@ -22,6 +22,14 @@ struct ReferenceTopKResult {
   std::vector<int> indices;
 };
 
+struct SegmentSelectState {
+  uint16_t prefix = 0;
+  uint16_t prefix_mask = 0;
+  int selected_count = 0;
+  int live_count = 0;
+  int boundary_digit = 0;
+};
+
 __host__ __device__ uint16_t normalize_half_bits(uint16_t bits);
 __host__ __device__ uint16_t encode_half_asc(half value);
 __host__ __device__ uint16_t encode_half_desc(half value);

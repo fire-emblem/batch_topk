@@ -1,6 +1,7 @@
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
 #include "final_block_sort.cuh"
+#include "radix_select_state.cuh"
 
 namespace radix_topk {
 
@@ -26,11 +27,16 @@ static bool has_valid_arguments(const half* d_input,
   return workspace_bytes >= batch_topk_half_workspace_size(seg_num, seg_len, k);
 }
 
+static size_t per_segment_workspace_bytes() {
+  return static_cast<size_t>(256u) * sizeof(unsigned int) +
+         sizeof(SegmentSelectState);
+}
+
 size_t batch_topk_half_workspace_size(int seg_num, int seg_len, int k) {
   if (!is_supported_shape(seg_num, seg_len, k)) {
     return 0u;
   }
-  return static_cast<size_t>(seg_num) * 4096u;
+  return static_cast<size_t>(seg_num) * per_segment_workspace_bytes();
 }
 
 cudaError_t batch_topk_half(const half* d_input,

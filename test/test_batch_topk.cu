@@ -4,6 +4,8 @@
 
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
+#include "../src/radix_histogram.cuh"
+#include "../src/radix_select_state.cuh"
 
 namespace {
 
@@ -52,6 +54,59 @@ bool check_candidate_tie_break() {
 
   return !radix_topk::candidate_better(lhs, rhs) &&
          radix_topk::candidate_better(rhs, lhs);
+}
+
+bool check_radix_boundary_state() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  const radix_topk::SegmentSelectState state =
+      radix_topk::simulate_radix_boundary(values, 8, 3);
+  return state.selected_count == 2 && state.live_count > 0 &&
+         state.boundary_digit >= 0;
+}
+
+bool check_histogram_pass() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  std::vector<half> host_input(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    host_input[i] = __float2half(values[i]);
+  }
+
+  half* d_input = nullptr;
+  unsigned int* d_histograms = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_histograms),
+                 sizeof(unsigned int) * 256) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_histograms);
+    cudaFree(d_input);
+    return false;
+  }
+
+  radix_topk::histogram_pass_kernel<<<1, 256>>>(d_input, 8, 8, d_histograms);
+  std::vector<unsigned int> histograms(256, 0);
+  const bool ok = cudaGetLastError() == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(histograms.data(),
+                             d_histograms,
+                             sizeof(unsigned int) * histograms.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_histograms);
+  cudaFree(d_input);
+  if (!ok) {
+    return false;
+  }
+
+  unsigned int sum = 0;
+  for (unsigned int count : histograms) {
+    sum += count;
+  }
+  return sum == values.size();
 }
 
 bool check_gpu_small_correctness() {
@@ -187,6 +242,14 @@ int main() {
   }
   if (!check_candidate_tie_break()) {
     std::fprintf(stderr, "candidate tie break is incorrect\n");
+    return 1;
+  }
+  if (!check_radix_boundary_state()) {
+    std::fprintf(stderr, "radix boundary state check failed\n");
+    return 1;
+  }
+  if (!check_histogram_pass()) {
+    std::fprintf(stderr, "histogram pass check failed\n");
     return 1;
   }
   if (!check_gpu_small_correctness()) {
