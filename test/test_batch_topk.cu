@@ -34,6 +34,26 @@ bool check_reference_bounded_seg_len() {
          result.values == std::vector<float>{2.0f, 1.0f};
 }
 
+bool check_half_codec_special_values() {
+  const uint16_t neg = radix_topk::encode_half_desc(__float2half(-1.0f));
+  const uint16_t pos = radix_topk::encode_half_desc(__float2half(3.0f));
+  const uint16_t nan = radix_topk::encode_half_desc(__float2half(NAN));
+  return pos < neg && nan > neg;
+}
+
+bool check_candidate_tie_break() {
+  radix_topk::Candidate lhs{};
+  lhs.value = __float2half(5.0f);
+  lhs.index = 2;
+
+  radix_topk::Candidate rhs{};
+  rhs.value = __float2half(5.0f);
+  rhs.index = 1;
+
+  return !radix_topk::candidate_better(lhs, rhs) &&
+         radix_topk::candidate_better(rhs, lhs);
+}
+
 }  // namespace
 
 int main() {
@@ -58,6 +78,14 @@ int main() {
   }
   if (!check_reference_bounded_seg_len()) {
     std::fprintf(stderr, "cpu reference seg_len clamping is incorrect\n");
+    return 1;
+  }
+  if (!check_half_codec_special_values()) {
+    std::fprintf(stderr, "half codec special values are incorrect\n");
+    return 1;
+  }
+  if (!check_candidate_tie_break()) {
+    std::fprintf(stderr, "candidate tie break is incorrect\n");
     return 1;
   }
 
