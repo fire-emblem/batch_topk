@@ -1,4 +1,6 @@
 #include "batch_topk.cuh"
+#include "batch_topk_types.cuh"
+#include "final_block_sort.cuh"
 
 namespace radix_topk {
 
@@ -39,7 +41,7 @@ cudaError_t batch_topk_half(const half* d_input,
                             int* d_output_indices,
                             void* d_workspace,
                             size_t workspace_bytes,
-                            cudaStream_t) {
+                            cudaStream_t stream) {
   if (!has_valid_arguments(d_input,
                            seg_num,
                            seg_len,
@@ -50,7 +52,10 @@ cudaError_t batch_topk_half(const half* d_input,
                            workspace_bytes)) {
     return cudaErrorInvalidValue;
   }
-  return cudaErrorNotSupported;
+  (void)d_workspace;
+  direct_segment_topk_kernel<<<seg_num, 1, 0, stream>>>(
+      d_input, seg_len, k, d_output_values, d_output_indices);
+  return cudaGetLastError();
 }
 
 }  // namespace radix_topk
