@@ -38,7 +38,9 @@ __device__ inline void insert_candidate_sorted(Candidate* topk,
   }
 }
 
-__global__ inline void final_candidate_sort_kernel(const Candidate* candidates,
+__global__ inline void final_candidate_sort_kernel(const half* input,
+                                                   int seg_len,
+                                                   const int* candidate_indices,
                                                    const int* candidate_counts,
                                                    int k,
                                                    half* output_values,
@@ -50,8 +52,9 @@ __global__ inline void final_candidate_sort_kernel(const Candidate* candidates,
     return;
   }
 
-  const Candidate* segment_candidates =
-      candidates + static_cast<size_t>(seg) * kCompactedCandidateCap;
+  const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
+  const int* segment_candidate_indices =
+      candidate_indices + static_cast<size_t>(seg) * kCompactedCandidateCap;
   half* segment_values = output_values + static_cast<size_t>(seg) * k;
   int* segment_indices = output_indices + static_cast<size_t>(seg) * k;
 
@@ -59,7 +62,10 @@ __global__ inline void final_candidate_sort_kernel(const Candidate* candidates,
   int count = 0;
   const int candidate_count = candidate_counts[seg];
   for (int i = 0; i < candidate_count; ++i) {
-    insert_candidate_sorted(topk, count, k, segment_candidates[i]);
+    const int index = segment_candidate_indices[i];
+    const half value = segment_input[index];
+    const Candidate candidate{encode_half_desc(value), value, index};
+    insert_candidate_sorted(topk, count, k, candidate);
   }
 
   for (int i = 0; i < k; ++i) {

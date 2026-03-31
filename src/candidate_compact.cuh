@@ -10,10 +10,7 @@
 
 namespace radix_topk {
 
-// Transitional compatibility cap for legacy Candidate-based compaction/sort.
-// This remains large enough for current behavior while keeping workspace below
-// the old full-candidate baseline used by contract checks.
-inline constexpr int kCompactedCandidateCap = 9000;
+inline constexpr int kCompactedCandidateCap = kOptimizedSegLen;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
@@ -26,10 +23,6 @@ struct CandidateCompactionWorkspaceView {
   SegmentSelectState* states = nullptr;
   int* candidate_counts = nullptr;
   int* candidate_indices = nullptr;
-
-  // Backward-compat pointers used by current kernels/callers.
-  unsigned int* histograms = nullptr;
-  Candidate* candidates = nullptr;
 };
 
 inline size_t candidate_compaction_workspace_bytes(int seg_num) {
@@ -46,9 +39,7 @@ inline size_t candidate_compaction_workspace_bytes(int seg_num) {
   offset += static_cast<size_t>(seg_num) * sizeof(SegmentSelectState);
   offset = align_up(offset, alignof(int));
   offset += static_cast<size_t>(seg_num) * sizeof(int);
-  offset += static_cast<size_t>(seg_num) * kOptimizedCandidateCap * sizeof(int);
-  offset = align_up(offset, alignof(Candidate));
-  offset += static_cast<size_t>(seg_num) * kCompactedCandidateCap * sizeof(Candidate);
+  offset += static_cast<size_t>(seg_num) * kCompactedCandidateCap * sizeof(int);
   return offset;
 }
 
@@ -80,25 +71,19 @@ inline CandidateCompactionWorkspaceView make_candidate_compaction_workspace(void
   offset += static_cast<size_t>(seg_num) * sizeof(int);
   view.candidate_indices = reinterpret_cast<int*>(
       static_cast<std::byte*>(workspace) + offset);
-  offset += static_cast<size_t>(seg_num) * kOptimizedCandidateCap * sizeof(int);
-  offset = align_up(offset, alignof(Candidate));
-  view.candidates = reinterpret_cast<Candidate*>(
-      static_cast<std::byte*>(workspace) + offset);
-
-  view.histograms = view.histograms_hi;
   return view;
 }
 
 __global__ inline void compact_candidates_kernel(const half* input,
                                                  int seg_len,
                                                  const SegmentSelectState* states,
-                                                 Candidate* candidates,
+                                                 int* candidate_indices,
                                                  int* candidate_counts) {
   const int seg = blockIdx.x;
   const SegmentSelectState state = states[seg];
   const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
-  Candidate* segment_candidates =
-      candidates + static_cast<size_t>(seg) * kCompactedCandidateCap;
+  int* segment_candidate_indices =
+      candidate_indices + static_cast<size_t>(seg) * kCompactedCandidateCap;
 
   __shared__ int block_count;
   if (threadIdx.x == 0) {
@@ -112,7 +97,7 @@ __global__ inline void compact_candidates_kernel(const half* input,
     if ((encoded & state.prefix_mask) <= state.prefix) {
       const int slot = atomicAdd(&block_count, 1);
       if (slot < kCompactedCandidateCap) {
-        segment_candidates[slot] = Candidate{encoded, value, i};
+        segment_candidate_indices[slot] = i;
       }
     }
   }

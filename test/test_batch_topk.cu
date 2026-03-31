@@ -192,11 +192,7 @@ bool check_optimized_workspace_layout_contract() {
   const auto view =
       radix_topk::make_candidate_compaction_workspace(storage.data(), seg_num);
   if (!view.histograms_hi || !view.histograms_lo || !view.partial_histograms ||
-      !view.states || !view.candidate_counts || !view.candidate_indices ||
-      !view.histograms || !view.candidates) {
-    return false;
-  }
-  if (view.histograms != view.histograms_hi) {
+      !view.states || !view.candidate_counts || !view.candidate_indices) {
     return false;
   }
 
@@ -229,13 +225,7 @@ bool check_optimized_workspace_layout_contract() {
     return false;
   }
   offset += static_cast<size_t>(seg_num) *
-            radix_topk::kOptimizedCandidateCap * sizeof(int);
-  offset = radix_topk::align_up(offset, alignof(radix_topk::Candidate));
-  if (reinterpret_cast<std::byte*>(view.candidates) != base + offset) {
-    return false;
-  }
-  offset += static_cast<size_t>(seg_num) *
-            radix_topk::kCompactedCandidateCap * sizeof(radix_topk::Candidate);
+            radix_topk::kCompactedCandidateCap * sizeof(int);
   return offset == workspace_bytes;
 }
 

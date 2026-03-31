@@ -98,13 +98,13 @@ cudaError_t batch_topk_half(const half* d_input,
 
   const CandidateCompactionWorkspaceView workspace =
       make_candidate_compaction_workspace(d_workspace, seg_num);
-  if (!workspace.histograms || !workspace.states || !workspace.candidate_counts ||
-      !workspace.candidates) {
+  if (!workspace.histograms_hi || !workspace.states || !workspace.candidate_counts ||
+      !workspace.candidate_indices) {
     return cudaErrorInvalidValue;
   }
 
   histogram_pass_kernel<<<seg_num, 256, 0, stream>>>(
-      d_input, seg_len, 8, 0u, 0u, workspace.histograms);
+      d_input, seg_len, 8, 0u, 0u, workspace.histograms_hi);
   cudaError_t status = cudaGetLastError();
   if (status != cudaSuccess) {
     return status;
@@ -116,7 +116,7 @@ cudaError_t batch_topk_half(const half* d_input,
 
   std::vector<unsigned int> host_histograms(static_cast<size_t>(seg_num) * 256u);
   status = cudaMemcpy(host_histograms.data(),
-                      workspace.histograms,
+                      workspace.histograms_hi,
                       sizeof(unsigned int) * host_histograms.size(),
                       cudaMemcpyDeviceToHost);
   if (status != cudaSuccess) {
@@ -134,7 +134,7 @@ cudaError_t batch_topk_half(const half* d_input,
   }
 
   compact_candidates_kernel<<<seg_num, 256, 0, stream>>>(
-      d_input, seg_len, workspace.states, workspace.candidates,
+      d_input, seg_len, workspace.states, workspace.candidate_indices,
       workspace.candidate_counts);
   status = cudaGetLastError();
   if (status != cudaSuccess) {
@@ -142,7 +142,12 @@ cudaError_t batch_topk_half(const half* d_input,
   }
 
   final_candidate_sort_kernel<<<seg_num, 1, 0, stream>>>(
-      workspace.candidates, workspace.candidate_counts, k, d_output_values,
+      d_input,
+      seg_len,
+      workspace.candidate_indices,
+      workspace.candidate_counts,
+      k,
+      d_output_values,
       d_output_indices);
   return cudaGetLastError();
 }
