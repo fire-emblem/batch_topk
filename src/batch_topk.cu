@@ -28,7 +28,7 @@ size_t batch_topk_half_workspace_size(int seg_num, int seg_len, int k) {
   if (!is_supported_shape(seg_num, seg_len, k)) {
     return 0u;
   }
-  return static_cast<size_t>(seg_num) * 256u;
+  return static_cast<size_t>(seg_num) * 4096u;
 }
 
 cudaError_t batch_topk_half(const half* d_input,
