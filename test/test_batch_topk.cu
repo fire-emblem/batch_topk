@@ -268,7 +268,8 @@ bool check_optimized_workspace_contract() {
       static_cast<size_t>(128) * 10000 * sizeof(radix_topk::Candidate);
   return workspace_bytes > 0 &&
          workspace_bytes < legacy_full_candidate_workspace_bytes &&
-         radix_topk::kOptimizedCandidateCap == 64;
+         radix_topk::kOptimizedCandidateCap == 64 &&
+         radix_topk::kCompactedCandidateCap >= radix_topk::kMaxSupportedK;
 }
 
 bool check_optimized_workspace_layout_contract() {
@@ -315,7 +316,7 @@ bool check_optimized_workspace_layout_contract() {
     return false;
   }
   offset += static_cast<size_t>(seg_num) *
-            radix_topk::kOptimizedCandidateCap * sizeof(int);
+            radix_topk::kCompactedCandidateCap * sizeof(int);
   return offset == workspace_bytes;
 }
 

@@ -11,7 +11,9 @@
 
 namespace radix_topk {
 
-inline constexpr int kCompactedCandidateCap = kOptimizedCandidateCap;
+// Runtime candidate storage must support the full public API range (k <= 128).
+// The optimized k=50 path still uses kOptimizedCandidateCap as its own target cap.
+inline constexpr int kCompactedCandidateCap = kMaxSupportedK;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
