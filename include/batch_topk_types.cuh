@@ -20,6 +20,11 @@ struct ReferenceTopKResult {
   std::vector<int> indices;
 };
 
+uint16_t normalize_half_bits(uint16_t bits);
+uint16_t encode_half_asc(half value);
+uint16_t encode_half_desc(half value);
+bool candidate_better(const Candidate& lhs, const Candidate& rhs);
+
 inline ReferenceTopKResult cpu_reference_topk(const std::vector<float>& values,
                                               int seg_len,
                                               int k) {
@@ -65,3 +70,5 @@ inline ReferenceTopKResult cpu_reference_topk(const std::vector<float>& values,
 }
 
 }  // namespace radix_topk
+
+#include "../src/type_codec.cuh"
