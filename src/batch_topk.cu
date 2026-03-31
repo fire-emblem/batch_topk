@@ -59,8 +59,8 @@ cudaError_t batch_topk_half(const half* d_input,
 
   const CandidateCompactionWorkspaceView workspace =
       make_candidate_compaction_workspace(d_workspace, seg_num);
-  if (!workspace.histograms_hi || !workspace.states || !workspace.candidate_counts ||
-      !workspace.candidate_indices) {
+  if (!workspace.histograms_hi || !workspace.histograms_lo || !workspace.states ||
+      !workspace.candidate_counts || !workspace.candidate_indices) {
     return cudaErrorInvalidValue;
   }
 

@@ -137,12 +137,21 @@ bool run_gpu_cutoff_selection(const std::vector<float>& values,
     return false;
   }
 
-  radix_topk::histogram_high_byte_kernel<<<1, 256>>>(d_input, static_cast<int>(values.size()), d_hist_hi);
-  radix_topk::select_high_byte_boundary_kernel<<<1, 1>>>(d_hist_hi, 1, k, d_state);
-  radix_topk::histogram_low_byte_kernel<<<1, 256>>>(d_input, static_cast<int>(values.size()), d_state, d_hist_lo);
-  radix_topk::finalize_cutoff_key_kernel<<<1, 1>>>(d_hist_lo, 1, k, d_state);
+  radix_topk::histogram_high_byte_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), d_hist_hi);
+  const bool launch_ok_hi = cudaPeekAtLastError() == cudaSuccess;
+  radix_topk::select_high_byte_boundary_kernel<<<1, 128>>>(d_hist_hi, 1, k, d_state);
+  const bool launch_ok_select = cudaPeekAtLastError() == cudaSuccess;
+  radix_topk::histogram_low_byte_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), d_state, d_hist_lo);
+  const bool launch_ok_lo = cudaPeekAtLastError() == cudaSuccess;
+  radix_topk::finalize_cutoff_key_kernel<<<1, 128>>>(d_hist_lo, 1, k, d_state);
+  const bool launch_ok_finalize = cudaPeekAtLastError() == cudaSuccess;
 
-  const bool ok = cudaGetLastError() == cudaSuccess &&
+  const bool ok = launch_ok_hi &&
+                  launch_ok_select &&
+                  launch_ok_lo &&
+                  launch_ok_finalize &&
                   cudaDeviceSynchronize() == cudaSuccess &&
                   cudaMemcpy(state_out,
                              d_state,
@@ -169,6 +178,22 @@ bool check_gpu_cutoff_selection() {
   return state.strictly_better_count == 2 &&
          state.remaining_slots == 1 &&
          state.cutoff_key == expected_cutoff;
+}
+
+bool check_gpu_cutoff_selection_fallback() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  radix_topk::SegmentSelectState state{};
+  if (!run_gpu_cutoff_selection(values, 9, &state)) {
+    return false;
+  }
+  return state.prefix == 0xffffu &&
+         state.prefix_mask == 0xffffu &&
+         state.cutoff_key == 0xffffu &&
+         state.live_count == 0 &&
+         state.boundary_digit == 255 &&
+         state.strictly_better_count == 8 &&
+         state.remaining_slots == 1;
 }
 
 bool check_histogram_pass() {
@@ -706,6 +731,10 @@ int main() {
   }
   if (!check_gpu_cutoff_selection()) {
     std::fprintf(stderr, "gpu cutoff selection check failed\n");
+    return 1;
+  }
+  if (!check_gpu_cutoff_selection_fallback()) {
+    std::fprintf(stderr, "gpu cutoff selection fallback check failed\n");
     return 1;
   }
   if (!check_gpu_small_correctness()) {

@@ -31,8 +31,17 @@ __global__ inline void select_high_byte_boundary_kernel(
     state.prefix_mask = 0xff00u;
     state.selected_count = selected;
     state.live_count = count;
-    break;
+    states[seg] = state;
+    return;
   }
+  state.prefix = 0xffffu;
+  state.prefix_mask = 0xffffu;
+  state.cutoff_key = 0xffffu;
+  state.selected_count = selected;
+  state.live_count = 0;
+  state.boundary_digit = 255;
+  state.strictly_better_count = selected;
+  state.remaining_slots = (k > selected) ? (k - selected) : 0;
   states[seg] = state;
 }
 
@@ -62,6 +71,10 @@ __global__ inline void finalize_cutoff_key_kernel(const unsigned int* histograms
     states[seg] = state;
     return;
   }
+  state.cutoff_key = 0xffffu;
+  state.strictly_better_count = selected;
+  state.remaining_slots = (k > selected) ? (k - selected) : 0;
+  states[seg] = state;
 }
 
 }  // namespace radix_topk
