@@ -70,6 +70,11 @@ cudaError_t batch_topk_half(const half* d_input,
   cudaError_t status = cudaSuccess;
   if (seg_len == kOptimizedSegLen && k == kOptimizedK) {
     const int ctas_per_segment = histogram_ctas_per_segment(seg_num);
+    if (ctas_per_segment < 1 ||
+        ctas_per_segment > kPartialHistogramMaxCtasPerSegment) {
+      // partial_histograms is provisioned for at most 4 split CTAs per segment.
+      return cudaErrorInvalidValue;
+    }
 
     if (ctas_per_segment == 1) {
       histogram_high_byte_kernel<<<seg_num, 256, 0, stream>>>(

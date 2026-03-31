@@ -50,6 +50,9 @@ __global__ inline void final_topk50_kernel(const half* input,
       const int partner = lane ^ stride;
       if (lane < kOptimizedCandidateCap && partner < kOptimizedCandidateCap &&
           lane < partner) {
+        // candidate_better defines "better" as larger value, then smaller index.
+        // Using ascending for the upper half of each bitonic block pushes worse
+        // items toward higher lanes so the final order is descending in that relation.
         const bool ascending = (lane & size) != 0;
         compare_swap(items, lane, partner, ascending);
       }

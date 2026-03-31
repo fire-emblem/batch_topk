@@ -14,6 +14,8 @@ namespace radix_topk {
 // Runtime candidate storage must support the full public API range (k <= 128).
 // The optimized k=50 path still uses kOptimizedCandidateCap as its own target cap.
 inline constexpr int kCompactedCandidateCap = kMaxSupportedK;
+// partial_histograms reserves one 256-bin histogram per split CTA, up to 4 CTAs/segment.
+inline constexpr int kPartialHistogramMaxCtasPerSegment = 4;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
@@ -37,7 +39,8 @@ inline size_t candidate_compaction_workspace_bytes(int seg_num) {
   offset = align_up(offset, alignof(unsigned int));
   offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
   offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
-  offset += static_cast<size_t>(seg_num) * 4u * 256u * sizeof(unsigned int);
+  offset += static_cast<size_t>(seg_num) * kPartialHistogramMaxCtasPerSegment * 256u *
+            sizeof(unsigned int);
   offset = align_up(offset, alignof(SegmentSelectState));
   offset += static_cast<size_t>(seg_num) * sizeof(SegmentSelectState);
   offset = align_up(offset, alignof(int));
@@ -63,7 +66,8 @@ inline CandidateCompactionWorkspaceView make_candidate_compaction_workspace(void
   offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
   view.partial_histograms = reinterpret_cast<unsigned int*>(
       static_cast<std::byte*>(workspace) + offset);
-  offset += static_cast<size_t>(seg_num) * 4u * 256u * sizeof(unsigned int);
+  offset += static_cast<size_t>(seg_num) * kPartialHistogramMaxCtasPerSegment * 256u *
+            sizeof(unsigned int);
   offset = align_up(offset, alignof(SegmentSelectState));
   view.states = reinterpret_cast<SegmentSelectState*>(
       static_cast<std::byte*>(workspace) + offset);
