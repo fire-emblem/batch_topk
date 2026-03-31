@@ -10,7 +10,7 @@
 
 namespace radix_topk {
 
-inline constexpr int kCompactedCandidateCap = kOptimizedSegLen;
+inline constexpr int kCompactedCandidateCap = kMaxSupportedSegLen;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);

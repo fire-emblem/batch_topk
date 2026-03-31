@@ -174,10 +174,11 @@ bool check_optimized_state_contract() {
 bool check_optimized_workspace_contract() {
   const size_t workspace_bytes =
       radix_topk::batch_topk_half_workspace_size(128, 10000, 50);
-  const size_t old_full_candidate_bytes =
+  // Baseline: legacy full Candidate-per-element storage at (128, 10000).
+  const size_t legacy_full_candidate_workspace_bytes =
       static_cast<size_t>(128) * 10000 * sizeof(radix_topk::Candidate);
   return workspace_bytes > 0 &&
-         workspace_bytes < old_full_candidate_bytes &&
+         workspace_bytes < legacy_full_candidate_workspace_bytes &&
          radix_topk::kOptimizedCandidateCap == 64;
 }
 

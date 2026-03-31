@@ -10,9 +10,17 @@
 namespace radix_topk {
 
 inline constexpr int kMaxSupportedK = 128;
+// Current correctness-first implementation supports seg_len up to this value.
+// Keep this tied to the optimized-shape contract to avoid drift.
+inline constexpr int kMaxSupportedSegLen = 10000;
+// Task-1 contract constants for the upcoming optimized fast path.
+// Later tasks will implement the optimized kernels that consume this contract.
 inline constexpr int kOptimizedSegLen = 10000;
 inline constexpr int kOptimizedK = 50;
 inline constexpr int kOptimizedCandidateCap = 64;
+
+static_assert(kMaxSupportedSegLen == kOptimizedSegLen,
+              "runtime supported seg_len must stay aligned with optimized contract");
 
 struct Candidate {
   uint32_t encoded_key = 0;
