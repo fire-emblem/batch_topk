@@ -7,12 +7,12 @@
 
 namespace radix_topk {
 
-__global__ void histogram_pass_kernel(const half* input,
-                                      int seg_len,
-                                      int shift,
-                                      uint16_t prefix,
-                                      uint16_t prefix_mask,
-                                      unsigned int* segment_histograms) {
+static __global__ void histogram_pass_kernel(const half* input,
+                                             int seg_len,
+                                             int shift,
+                                             uint16_t prefix,
+                                             uint16_t prefix_mask,
+                                             unsigned int* segment_histograms) {
   const int seg = blockIdx.x;
   const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
 
