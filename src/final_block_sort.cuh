@@ -1,10 +1,11 @@
 #pragma once
 
+#include "candidate_compact.cuh"
 #include "batch_topk_types.cuh"
 
 namespace radix_topk {
 
-static_assert(kMaxSupportedK == 128, "direct baseline kernel expects 128-slot storage");
+static_assert(kMaxSupportedK == 128, "final sort kernel expects 128-slot storage");
 
 __device__ inline void insert_candidate_sorted(Candidate* topk,
                                                int& count,
@@ -37,28 +38,28 @@ __device__ inline void insert_candidate_sorted(Candidate* topk,
   }
 }
 
-__global__ inline void direct_segment_topk_kernel(const half* input,
-                                                  int seg_len,
-                                                  int k,
-                                                  half* output_values,
-                                                  int* output_indices) {
+__global__ inline void final_candidate_sort_kernel(const Candidate* candidates,
+                                                   const int* candidate_counts,
+                                                   int k,
+                                                   half* output_values,
+                                                   int* output_indices) {
+  static_assert(kMaxSupportedK == 128, "final sort kernel relies on 128-slot storage");
+
+  const int seg = blockIdx.x;
   if (threadIdx.x != 0) {
     return;
   }
 
-  const int seg = blockIdx.x;
-  const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
+  const Candidate* segment_candidates =
+      candidates + static_cast<size_t>(seg) * kCompactedCandidateCap;
   half* segment_values = output_values + static_cast<size_t>(seg) * k;
   int* segment_indices = output_indices + static_cast<size_t>(seg) * k;
 
   Candidate topk[kMaxSupportedK];
   int count = 0;
-  for (int i = 0; i < seg_len; ++i) {
-    Candidate candidate{};
-    candidate.encoded_key = encode_half_desc(segment_input[i]);
-    candidate.value = segment_input[i];
-    candidate.index = i;
-    insert_candidate_sorted(topk, count, k, candidate);
+  const int candidate_count = candidate_counts[seg];
+  for (int i = 0; i < candidate_count; ++i) {
+    insert_candidate_sorted(topk, count, k, segment_candidates[i]);
   }
 
   for (int i = 0; i < k; ++i) {

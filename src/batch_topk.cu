@@ -1,7 +1,11 @@
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
+#include "candidate_compact.cuh"
 #include "final_block_sort.cuh"
+#include "radix_histogram.cuh"
 #include "radix_select_state.cuh"
+
+#include <vector>
 
 namespace radix_topk {
 
@@ -27,16 +31,49 @@ static bool has_valid_arguments(const half* d_input,
   return workspace_bytes >= batch_topk_half_workspace_size(seg_num, seg_len, k);
 }
 
-static size_t per_segment_workspace_bytes() {
-  return static_cast<size_t>(256u) * sizeof(unsigned int) +
-         sizeof(SegmentSelectState);
+static SegmentSelectState select_state_from_histogram(const unsigned int* histogram,
+                                                      int k) {
+  SegmentSelectState state{};
+  int selected_count = 0;
+  for (int bucket = 0; bucket < 256; ++bucket) {
+    const int bucket_count = static_cast<int>(histogram[static_cast<size_t>(bucket)]);
+    if (selected_count + bucket_count < k) {
+      selected_count += bucket_count;
+      continue;
+    }
+    state.prefix = static_cast<uint16_t>(bucket << 8);
+    state.prefix_mask = 0xff00u;
+    state.selected_count = selected_count;
+    state.live_count = bucket_count;
+    state.boundary_digit = bucket;
+    return state;
+  }
+
+  state.prefix = 0xffffu;
+  state.prefix_mask = 0xffffu;
+  state.selected_count = selected_count;
+  state.live_count = 0;
+  state.boundary_digit = 255;
+  return state;
+}
+
+static bool build_segment_select_states(const unsigned int* histograms,
+                                       int seg_num,
+                                       int k,
+                                       std::vector<SegmentSelectState>* states) {
+  states->resize(static_cast<size_t>(seg_num));
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const unsigned int* histogram = histograms + static_cast<size_t>(seg) * 256u;
+    (*states)[static_cast<size_t>(seg)] = select_state_from_histogram(histogram, k);
+  }
+  return true;
 }
 
 size_t batch_topk_half_workspace_size(int seg_num, int seg_len, int k) {
   if (!is_supported_shape(seg_num, seg_len, k)) {
     return 0u;
   }
-  return static_cast<size_t>(seg_num) * per_segment_workspace_bytes();
+  return candidate_compaction_workspace_bytes(seg_num);
 }
 
 cudaError_t batch_topk_half(const half* d_input,
@@ -58,9 +95,55 @@ cudaError_t batch_topk_half(const half* d_input,
                            workspace_bytes)) {
     return cudaErrorInvalidValue;
   }
-  (void)d_workspace;
-  direct_segment_topk_kernel<<<seg_num, 1, 0, stream>>>(
-      d_input, seg_len, k, d_output_values, d_output_indices);
+
+  const CandidateCompactionWorkspaceView workspace =
+      make_candidate_compaction_workspace(d_workspace, seg_num);
+  if (!workspace.histograms || !workspace.states || !workspace.candidate_counts ||
+      !workspace.candidates) {
+    return cudaErrorInvalidValue;
+  }
+
+  histogram_pass_kernel<<<seg_num, 256, 0, stream>>>(
+      d_input, seg_len, 8, 0u, 0u, workspace.histograms);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+  status = cudaStreamSynchronize(stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  std::vector<unsigned int> host_histograms(static_cast<size_t>(seg_num) * 256u);
+  status = cudaMemcpy(host_histograms.data(),
+                      workspace.histograms,
+                      sizeof(unsigned int) * host_histograms.size(),
+                      cudaMemcpyDeviceToHost);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  std::vector<SegmentSelectState> host_states;
+  build_segment_select_states(host_histograms.data(), seg_num, k, &host_states);
+  status = cudaMemcpy(workspace.states,
+                      host_states.data(),
+                      sizeof(SegmentSelectState) * host_states.size(),
+                      cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  compact_candidates_kernel<<<seg_num, 256, 0, stream>>>(
+      d_input, seg_len, workspace.states, workspace.candidates,
+      workspace.candidate_counts);
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  final_candidate_sort_kernel<<<seg_num, 1, 0, stream>>>(
+      workspace.candidates, workspace.candidate_counts, k, d_output_values,
+      d_output_indices);
   return cudaGetLastError();
 }
 
