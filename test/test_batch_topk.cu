@@ -1,7 +1,9 @@
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <vector>
 
+#include "batch_topk_benchmark.cuh"
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
 #include "../src/candidate_compact.cuh"
@@ -139,6 +141,23 @@ bool check_histogram_pass() {
   return true;
 }
 
+bool check_benchmark_target_matrix() {
+  constexpr auto cases = radix_topk::kPrimaryBenchmarkCases;
+  if (cases.size() != 5) {
+    return false;
+  }
+
+  static constexpr int kExpectedSegNums[5] = {128, 1500, 3000, 4500, 6000};
+  static constexpr float kExpectedRefs[5] = {11.0f, 82.0f, 161.0f, 241.0f, 319.0f};
+  for (size_t i = 0; i < cases.size(); ++i) {
+    if (cases[i].seg_num != kExpectedSegNums[i] || cases[i].seg_len != 10000 ||
+        cases[i].k != 50 || cases[i].ref_us != kExpectedRefs[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool check_gpu_small_correctness() {
   const int seg_num = 2;
   const int seg_len = 8;
@@ -201,6 +220,10 @@ bool check_gpu_small_correctness() {
   cudaFree(d_output_values);
   cudaFree(d_input);
   if (!ok) {
+    std::fprintf(stderr,
+                 "random regression runtime failure: call=%s sync=%s\n",
+                 cudaGetErrorString(status),
+                 cudaGetErrorString(cudaDeviceSynchronize()));
     return false;
   }
 
@@ -211,14 +234,33 @@ bool check_gpu_small_correctness() {
     const radix_topk::ReferenceTopKResult expected =
         radix_topk::cpu_reference_topk(segment, seg_len, k);
     for (int i = 0; i < k; ++i) {
-      if (output_indices[static_cast<size_t>(seg) * k + i] != expected.indices[i] ||
-          __half2float(output_values[static_cast<size_t>(seg) * k + i]) !=
-              expected.values[i]) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        std::fprintf(stderr,
+                     "random segment %d mismatch at %d: got (%d, %.5f) expected (%d, %.5f)\n",
+                     seg,
+                     i,
+                     actual_index,
+                     actual_value,
+                     expected.indices[i],
+                     expected.values[i]);
         return false;
       }
     }
   }
   return true;
+}
+
+std::vector<float> make_random_input(int seg_num, int seg_len, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-64.0f, 64.0f);
+  std::vector<float> values(static_cast<size_t>(seg_num) * seg_len);
+  for (float& value : values) {
+    value = __half2float(__float2half(dist(rng)));
+  }
+  return values;
 }
 
 std::vector<float> make_duplicate_heavy_input(int seg_num, int seg_len) {
@@ -344,6 +386,113 @@ bool check_gpu_duplicate_heavy_k50() {
   return true;
 }
 
+bool check_gpu_large_random_regression() {
+  const int seg_num = 128;
+  const int seg_len = 10000;
+  const int k = 50;
+  const std::vector<float> host_values = make_random_input(seg_num, seg_len, 1234u);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  const size_t workspace_size =
+      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
+  half* d_input = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  void* d_workspace = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  const cudaError_t status = radix_topk::batch_topk_half(
+      d_input,
+      seg_num,
+      seg_len,
+      k,
+      d_output_values,
+      d_output_indices,
+      d_workspace,
+      workspace_size,
+      0);
+  std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
+  std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  std::vector<int> candidate_counts(seg_num, 0);
+  const auto workspace_view =
+      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
+  const cudaError_t sync_status = cudaDeviceSynchronize();
+  const cudaError_t values_status = cudaMemcpy(output_values.data(),
+                                               d_output_values,
+                                               sizeof(half) * output_values.size(),
+                                               cudaMemcpyDeviceToHost);
+  const cudaError_t indices_status = cudaMemcpy(output_indices.data(),
+                                                d_output_indices,
+                                                sizeof(int) * output_indices.size(),
+                                                cudaMemcpyDeviceToHost);
+  const cudaError_t counts_status = cudaMemcpy(candidate_counts.data(),
+                                               workspace_view.candidate_counts,
+                                               sizeof(int) * candidate_counts.size(),
+                                               cudaMemcpyDeviceToHost);
+  const bool ok = status == cudaSuccess && sync_status == cudaSuccess &&
+                  values_status == cudaSuccess && indices_status == cudaSuccess &&
+                  counts_status == cudaSuccess;
+  cudaFree(d_workspace);
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_input);
+  if (!ok) {
+    std::fprintf(stderr,
+                 "random regression runtime failure: call=%s sync=%s values=%s indices=%s counts=%s\n",
+                 cudaGetErrorString(status),
+                 cudaGetErrorString(sync_status),
+                 cudaGetErrorString(values_status),
+                 cudaGetErrorString(indices_status),
+                 cudaGetErrorString(counts_status));
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
+    const auto end = begin + seg_len;
+    const std::vector<float> segment(begin, end);
+    const radix_topk::ReferenceTopKResult expected =
+        radix_topk::cpu_reference_topk(segment, seg_len, k);
+    for (int i = 0; i < k; ++i) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        std::fprintf(stderr,
+                     "random segment %d mismatch at %d: got (%d, %.5f) expected (%d, %.5f), candidates=%d\n",
+                     seg,
+                     i,
+                     actual_index,
+                     actual_value,
+                     expected.indices[i],
+                     expected.values[i],
+                     candidate_counts[seg]);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 __global__ void codec_smoke_kernel(uint16_t* keys_out, int* better_out) {
@@ -405,12 +554,20 @@ int main() {
     std::fprintf(stderr, "histogram pass check failed\n");
     return 1;
   }
+  if (!check_benchmark_target_matrix()) {
+    std::fprintf(stderr, "benchmark target matrix is incorrect\n");
+    return 1;
+  }
   if (!check_gpu_small_correctness()) {
     std::fprintf(stderr, "gpu small correctness check failed\n");
     return 1;
   }
   if (!check_gpu_duplicate_heavy_k50()) {
     std::fprintf(stderr, "gpu duplicate-heavy k50 check failed\n");
+    return 1;
+  }
+  if (!check_gpu_large_random_regression()) {
+    std::fprintf(stderr, "gpu large random regression failed\n");
     return 1;
   }
 

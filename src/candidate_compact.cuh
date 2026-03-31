@@ -10,7 +10,10 @@
 
 namespace radix_topk {
 
-inline constexpr int kCompactedCandidateCap = 512;
+// Correctness-first cap: the current supported path allows seg_len up to 10000,
+// so compaction must be able to retain the full segment when radix reduction
+// is not yet selective enough.
+inline constexpr int kCompactedCandidateCap = 10000;
 
 inline size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
