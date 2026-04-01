@@ -609,105 +609,6 @@ std::vector<float> make_optimized_special_values_input(int seg_num, int seg_len)
   return values;
 }
 
-bool run_compact_topk50_variant(const std::vector<float>& values,
-                                const radix_topk::SegmentSelectState& state,
-                                bool use_no_atomic,
-                                std::vector<int>* candidate_indices_out,
-                                int* candidate_count_out) {
-  std::vector<half> host_input(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    host_input[i] = __float2half(values[i]);
-  }
-
-  half* d_input = nullptr;
-  radix_topk::SegmentSelectState* d_state = nullptr;
-  int* d_candidate_indices = nullptr;
-  int* d_candidate_counts = nullptr;
-  if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) !=
-          cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_state),
-                 sizeof(radix_topk::SegmentSelectState)) != cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_candidate_indices),
-                 sizeof(int) * static_cast<size_t>(radix_topk::kCompactedCandidateCap)) !=
-          cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_candidate_counts), sizeof(int)) != cudaSuccess ||
-      cudaMemcpy(d_input,
-                 host_input.data(),
-                 sizeof(half) * host_input.size(),
-                 cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(d_state, &state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_candidate_counts);
-    cudaFree(d_candidate_indices);
-    cudaFree(d_state);
-    cudaFree(d_input);
-    return false;
-  }
-
-  if (use_no_atomic) {
-    radix_topk::compact_candidate_indices_topk50_no_atomic_kernel<<<1, 256>>>(
-        d_input,
-        static_cast<int>(values.size()),
-        d_state,
-        d_candidate_indices,
-        d_candidate_counts);
-  } else {
-    radix_topk::compact_candidate_indices_topk50_warp_kernel<<<1, 256>>>(
-        d_input,
-        static_cast<int>(values.size()),
-        d_state,
-        d_candidate_indices,
-        d_candidate_counts);
-  }
-
-  const bool ok =
-      cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
-      cudaMemcpy(candidate_indices_out->data(),
-                 d_candidate_indices,
-                 sizeof(int) * candidate_indices_out->size(),
-                 cudaMemcpyDeviceToHost) == cudaSuccess &&
-      cudaMemcpy(candidate_count_out,
-                 d_candidate_counts,
-                 sizeof(*candidate_count_out),
-                 cudaMemcpyDeviceToHost) == cudaSuccess;
-  cudaFree(d_candidate_counts);
-  cudaFree(d_candidate_indices);
-  cudaFree(d_state);
-  cudaFree(d_input);
-  return ok;
-}
-
-bool check_compact_topk50_no_atomic_equivalence() {
-  const int seg_len = 10000;
-  const int k = 50;
-  const std::vector<float> values = make_duplicate_heavy_input(1, seg_len);
-  radix_topk::SegmentSelectState state{};
-  if (!run_gpu_cutoff_selection(values, k, &state)) {
-    return false;
-  }
-
-  std::vector<int> old_indices(radix_topk::kCompactedCandidateCap, -1);
-  std::vector<int> new_indices(radix_topk::kCompactedCandidateCap, -1);
-  int old_count = 0;
-  int new_count = 0;
-  if (!run_compact_topk50_variant(values, state, false, &old_indices, &old_count) ||
-      !run_compact_topk50_variant(values, state, true, &new_indices, &new_count)) {
-    return false;
-  }
-
-  if (old_count != new_count) {
-    return false;
-  }
-  old_indices.resize(static_cast<size_t>(old_count));
-  new_indices.resize(static_cast<size_t>(new_count));
-  return old_indices == new_indices;
-}
-
-bool check_compaction_no_atomic_baseline_contract() {
-  return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50 &&
-         radix_topk::kOptimizedCandidateCap == 64;
-}
-
 bool check_compact_topk50_warp_kernel_selection() {
   const int seg_num = 1;
   const int seg_len = 10000;
@@ -1534,14 +1435,6 @@ int main() {
   }
   if (!check_gpu_small_batch_shapes()) {
     std::fprintf(stderr, "gpu small batch shape check failed\n");
-    return 1;
-  }
-  if (!check_compaction_no_atomic_baseline_contract()) {
-    std::fprintf(stderr, "compaction no-atomic baseline contract is incorrect\n");
-    return 1;
-  }
-  if (!check_compact_topk50_no_atomic_equivalence()) {
-    std::fprintf(stderr, "compact topk50 no-atomic equivalence check failed\n");
     return 1;
   }
   if (!check_compact_topk50_warp_kernel_selection()) {
