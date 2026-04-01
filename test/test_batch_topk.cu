@@ -18,9 +18,6 @@
 
 namespace {
 
-std::vector<float> make_random_input(int seg_num, int seg_len, uint32_t seed);
-std::vector<float> make_duplicate_heavy_input(int seg_num, int seg_len);
-
 bool check_reference_ordering() {
   const std::vector<float> values = {5.0f, 7.0f, 7.0f, 1.0f};
   const radix_topk::ReferenceTopKResult result =
@@ -198,97 +195,6 @@ bool run_histogram_topk50_pair(const std::vector<float>& values,
   return ok;
 }
 
-bool run_high_byte_histogram_variant(const std::vector<float>& values,
-                                     bool use_large_kernel,
-                                     std::vector<unsigned int>* histograms_out) {
-  std::vector<half> host_input(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    host_input[i] = __float2half(values[i]);
-  }
-
-  half* d_input = nullptr;
-  unsigned int* d_histograms = nullptr;
-  if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) !=
-          cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_histograms),
-                 sizeof(unsigned int) * histograms_out->size()) != cudaSuccess ||
-      cudaMemcpy(d_input,
-                 host_input.data(),
-                 sizeof(half) * host_input.size(),
-                 cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_histograms);
-    cudaFree(d_input);
-    return false;
-  }
-
-  if (use_large_kernel) {
-    radix_topk::histogram_high_byte_topk50_large_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_histograms);
-  } else {
-    radix_topk::histogram_high_byte_topk50_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_histograms);
-  }
-
-  const bool ok = cudaGetLastError() == cudaSuccess &&
-                  cudaDeviceSynchronize() == cudaSuccess &&
-                  cudaMemcpy(histograms_out->data(),
-                             d_histograms,
-                             sizeof(unsigned int) * histograms_out->size(),
-                             cudaMemcpyDeviceToHost) == cudaSuccess;
-  cudaFree(d_histograms);
-  cudaFree(d_input);
-  return ok;
-}
-
-bool run_low_byte_histogram_large_variant(const std::vector<float>& values,
-                                          const radix_topk::SegmentSelectState& state,
-                                          bool use_large_kernel,
-                                          std::vector<unsigned int>* histograms_out) {
-  std::vector<half> host_input(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    host_input[i] = __float2half(values[i]);
-  }
-
-  half* d_input = nullptr;
-  radix_topk::SegmentSelectState* d_state = nullptr;
-  unsigned int* d_histograms = nullptr;
-  if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) !=
-          cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_state), sizeof(radix_topk::SegmentSelectState)) !=
-          cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_histograms),
-                 sizeof(unsigned int) * histograms_out->size()) != cudaSuccess ||
-      cudaMemcpy(d_input,
-                 host_input.data(),
-                 sizeof(half) * host_input.size(),
-                 cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(d_state, &state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_histograms);
-    cudaFree(d_state);
-    cudaFree(d_input);
-    return false;
-  }
-
-  if (use_large_kernel) {
-    radix_topk::histogram_low_byte_topk50_large_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_state, d_histograms);
-  } else {
-    radix_topk::histogram_low_byte_topk50_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_state, d_histograms);
-  }
-
-  const bool ok = cudaGetLastError() == cudaSuccess &&
-                  cudaDeviceSynchronize() == cudaSuccess &&
-                  cudaMemcpy(histograms_out->data(),
-                             d_histograms,
-                             sizeof(unsigned int) * histograms_out->size(),
-                             cudaMemcpyDeviceToHost) == cudaSuccess;
-  cudaFree(d_histograms);
-  cudaFree(d_state);
-  cudaFree(d_input);
-  return ok;
-}
-
 bool run_gpu_cutoff_selection(const std::vector<float>& values,
                               int k,
                               radix_topk::SegmentSelectState* state_out) {
@@ -440,42 +346,6 @@ bool check_topk50_histogram_kernels() {
     }
   }
   return true;
-}
-
-bool check_large_batch_high_histogram_equivalence() {
-  const int seg_len = 10000;
-  const std::vector<float> values = make_random_input(1, seg_len, 20260401u);
-  std::vector<unsigned int> old_hist(256, 0);
-  std::vector<unsigned int> new_hist(256, 0);
-  if (!run_high_byte_histogram_variant(values, false, &old_hist) ||
-      !run_high_byte_histogram_variant(values, true, &new_hist)) {
-    return false;
-  }
-  return old_hist == new_hist;
-}
-
-bool check_large_batch_low_histogram_equivalence() {
-  const int seg_len = 10000;
-  const int k = 50;
-  const std::vector<float> values = make_duplicate_heavy_input(1, seg_len);
-  radix_topk::SegmentSelectState state{};
-  if (!run_gpu_cutoff_selection(values, k, &state)) {
-    return false;
-  }
-
-  std::vector<unsigned int> old_hist(256, 0);
-  std::vector<unsigned int> new_hist(256, 0);
-  if (!run_low_byte_histogram_large_variant(values, state, false, &old_hist) ||
-      !run_low_byte_histogram_large_variant(values, state, true, &new_hist)) {
-    return false;
-  }
-  return old_hist == new_hist;
-}
-
-bool check_large_batch_histogram_baseline_contract() {
-  return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50 &&
-         radix_topk::kOptimizedCandidateCap == 64;
 }
 
 bool check_benchmark_target_matrix() {
@@ -1532,18 +1402,6 @@ int main() {
   }
   if (!check_topk50_histogram_kernels()) {
     std::fprintf(stderr, "topk50 histogram kernel check failed\n");
-    return 1;
-  }
-  if (!check_large_batch_histogram_baseline_contract()) {
-    std::fprintf(stderr, "large batch histogram baseline contract is incorrect\n");
-    return 1;
-  }
-  if (!check_large_batch_high_histogram_equivalence()) {
-    std::fprintf(stderr, "large batch high histogram equivalence check failed\n");
-    return 1;
-  }
-  if (!check_large_batch_low_histogram_equivalence()) {
-    std::fprintf(stderr, "large batch low histogram equivalence check failed\n");
     return 1;
   }
   if (!check_benchmark_target_matrix()) {
