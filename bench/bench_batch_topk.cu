@@ -1,4 +1,3 @@
-#include <chrono>
 #include <cstdio>
 #include <vector>
 
@@ -54,8 +53,8 @@ bool run_benchmark_case(const radix_topk::BenchmarkCase& benchmark_case,
     return false;
   }
 
-  constexpr int kWarmupIterations = 1;
-  constexpr int kMeasureIterations = 3;
+  constexpr int kWarmupIterations = 5;
+  constexpr int kMeasureIterations = 20;
   for (int iter = 0; iter < kWarmupIterations; ++iter) {
     const cudaError_t status = radix_topk::batch_topk_half(
         d_input, seg_num, seg_len, k, d_values, d_indices, d_workspace,
@@ -69,12 +68,39 @@ bool run_benchmark_case(const radix_topk::BenchmarkCase& benchmark_case,
     }
   }
 
-  const auto start = std::chrono::steady_clock::now();
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  if (cudaEventCreate(&start) != cudaSuccess ||
+      cudaEventCreate(&stop) != cudaSuccess) {
+    if (start != nullptr) {
+      cudaEventDestroy(start);
+    }
+    if (stop != nullptr) {
+      cudaEventDestroy(stop);
+    }
+    cudaFree(d_workspace);
+    cudaFree(d_indices);
+    cudaFree(d_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  if (cudaEventRecord(start) != cudaSuccess) {
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    cudaFree(d_workspace);
+    cudaFree(d_indices);
+    cudaFree(d_values);
+    cudaFree(d_input);
+    return false;
+  }
   for (int iter = 0; iter < kMeasureIterations; ++iter) {
     const cudaError_t status = radix_topk::batch_topk_half(
         d_input, seg_num, seg_len, k, d_values, d_indices, d_workspace,
         workspace_size, 0);
-    if (status != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+    if (status != cudaSuccess) {
+      cudaEventDestroy(stop);
+      cudaEventDestroy(start);
       cudaFree(d_workspace);
       cudaFree(d_indices);
       cudaFree(d_values);
@@ -82,9 +108,37 @@ bool run_benchmark_case(const radix_topk::BenchmarkCase& benchmark_case,
       return false;
     }
   }
-  const auto end = std::chrono::steady_clock::now();
-  const std::chrono::duration<double, std::micro> elapsed = end - start;
-  *latency_us = static_cast<float>(elapsed.count() / kMeasureIterations);
+  if (cudaEventRecord(stop) != cudaSuccess ||
+      cudaEventSynchronize(stop) != cudaSuccess) {
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    cudaFree(d_workspace);
+    cudaFree(d_indices);
+    cudaFree(d_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  float elapsed_ms = 0.0f;
+  if (cudaEventElapsedTime(&elapsed_ms, start, stop) != cudaSuccess) {
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    cudaFree(d_workspace);
+    cudaFree(d_indices);
+    cudaFree(d_values);
+    cudaFree(d_input);
+    return false;
+  }
+  *latency_us = elapsed_ms * 1000.0f / kMeasureIterations;
+
+  if (cudaEventDestroy(stop) != cudaSuccess ||
+      cudaEventDestroy(start) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_indices);
+    cudaFree(d_values);
+    cudaFree(d_input);
+    return false;
+  }
 
   if (cudaFree(d_workspace) != cudaSuccess || cudaFree(d_indices) != cudaSuccess ||
       cudaFree(d_values) != cudaSuccess || cudaFree(d_input) != cudaSuccess) {

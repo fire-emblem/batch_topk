@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -7,6 +8,9 @@
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
 #include "../src/candidate_compact.cuh"
+#include "../src/dispatch_policy.cuh"
+#include "../src/final_topk50.cuh"
+#include "../src/radix_boundary_select.cuh"
 #include "../src/radix_histogram.cuh"
 #include "../src/radix_select_state.cuh"
 
@@ -108,6 +112,94 @@ bool run_histogram_pass(const std::vector<float>& values,
   return ok;
 }
 
+bool run_gpu_cutoff_selection(const std::vector<float>& values,
+                              int k,
+                              radix_topk::SegmentSelectState* state_out) {
+  std::vector<half> host_input(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    host_input[i] = __float2half(values[i]);
+  }
+
+  half* d_input = nullptr;
+  unsigned int* d_hist_hi = nullptr;
+  unsigned int* d_hist_lo = nullptr;
+  radix_topk::SegmentSelectState* d_state = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_hist_hi), sizeof(unsigned int) * 256) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_hist_lo), sizeof(unsigned int) * 256) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_state), sizeof(radix_topk::SegmentSelectState)) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_state);
+    cudaFree(d_hist_lo);
+    cudaFree(d_hist_hi);
+    cudaFree(d_input);
+    return false;
+  }
+
+  radix_topk::histogram_high_byte_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), d_hist_hi);
+  const cudaError_t launch_status_hi = cudaGetLastError();
+  radix_topk::select_high_byte_boundary_kernel<<<1, 128>>>(d_hist_hi, 1, k, d_state);
+  const cudaError_t launch_status_select = cudaGetLastError();
+  radix_topk::histogram_low_byte_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), d_state, d_hist_lo);
+  const cudaError_t launch_status_lo = cudaGetLastError();
+  radix_topk::finalize_cutoff_key_kernel<<<1, 128>>>(d_hist_lo, 1, k, d_state);
+  const cudaError_t launch_status_finalize = cudaGetLastError();
+
+  const bool ok = launch_status_hi == cudaSuccess &&
+                  launch_status_select == cudaSuccess &&
+                  launch_status_lo == cudaSuccess &&
+                  launch_status_finalize == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(state_out,
+                             d_state,
+                             sizeof(radix_topk::SegmentSelectState),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_state);
+  cudaFree(d_hist_lo);
+  cudaFree(d_hist_hi);
+  cudaFree(d_input);
+  return ok;
+}
+
+bool check_gpu_cutoff_selection() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  const uint16_t expected_cutoff =
+      radix_topk::encode_half_desc(__float2half(7.0f));
+
+  radix_topk::SegmentSelectState state{};
+  if (!run_gpu_cutoff_selection(values, 3, &state)) {
+    return false;
+  }
+
+  return state.strictly_better_count == 2 &&
+         state.remaining_slots == 1 &&
+         state.cutoff_key == expected_cutoff;
+}
+
+// Defensive unit-level check: this intentionally uses k > seg_len to force the
+// sentinel fallback path in boundary selection kernels.
+bool check_gpu_cutoff_selection_fallback() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  radix_topk::SegmentSelectState state{};
+  if (!run_gpu_cutoff_selection(values, 9, &state)) {
+    return false;
+  }
+  return state.prefix == 0xffffu &&
+         state.prefix_mask == 0xffffu &&
+         state.cutoff_key == 0xffffu &&
+         state.live_count == 0 &&
+         state.boundary_digit == 255 &&
+         state.strictly_better_count == 8 &&
+         state.remaining_slots == 1;
+}
+
 bool check_histogram_pass() {
   const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
                                      5.0f, 4.0f, 3.0f, 2.0f};
@@ -156,6 +248,85 @@ bool check_benchmark_target_matrix() {
     }
   }
   return true;
+}
+
+bool check_benchmark_measurement_contract() {
+  return radix_topk::kPrimaryBenchmarkCases[0].seg_num == 128 &&
+         radix_topk::kPrimaryBenchmarkCases[4].seg_num == 6000;
+}
+
+bool check_optimized_state_contract() {
+  radix_topk::SegmentSelectState state{};
+  return state.prefix == 0u &&
+         state.prefix_mask == 0u &&
+         state.cutoff_key == 0xffffu &&
+         state.selected_count == 0 &&
+         state.live_count == 0 &&
+         state.boundary_digit == 0 &&
+         state.strictly_better_count == 0 &&
+         state.remaining_slots == 0;
+}
+
+bool check_optimized_workspace_contract() {
+  const size_t workspace_bytes =
+      radix_topk::batch_topk_half_workspace_size(128, 10000, 50);
+  // Baseline: legacy full Candidate-per-element storage at (128, 10000).
+  const size_t legacy_full_candidate_workspace_bytes =
+      static_cast<size_t>(128) * 10000 * sizeof(radix_topk::Candidate);
+  return workspace_bytes > 0 &&
+         workspace_bytes < legacy_full_candidate_workspace_bytes &&
+         radix_topk::kOptimizedCandidateCap == 64 &&
+         radix_topk::kCompactedCandidateCap >= radix_topk::kMaxSupportedK;
+}
+
+bool check_optimized_workspace_layout_contract() {
+  const int seg_num = 3;
+  const size_t workspace_bytes =
+      radix_topk::candidate_compaction_workspace_bytes(seg_num);
+  if (workspace_bytes == 0) {
+    return false;
+  }
+  std::vector<std::byte> storage(workspace_bytes);
+  const auto view =
+      radix_topk::make_candidate_compaction_workspace(storage.data(), seg_num);
+  if (!view.histograms_hi || !view.histograms_lo || !view.partial_histograms ||
+      !view.states || !view.candidate_counts || !view.candidate_indices) {
+    return false;
+  }
+
+  const auto* const base = storage.data();
+  size_t offset = 0u;
+  offset = radix_topk::align_up(offset, alignof(unsigned int));
+  if (reinterpret_cast<std::byte*>(view.histograms_hi) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  if (reinterpret_cast<std::byte*>(view.histograms_lo) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * 256u * sizeof(unsigned int);
+  if (reinterpret_cast<std::byte*>(view.partial_histograms) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) *
+            radix_topk::kPartialHistogramMaxCtasPerSegment * 256u *
+            sizeof(unsigned int);
+  offset = radix_topk::align_up(offset, alignof(radix_topk::SegmentSelectState));
+  if (reinterpret_cast<std::byte*>(view.states) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * sizeof(radix_topk::SegmentSelectState);
+  offset = radix_topk::align_up(offset, alignof(int));
+  if (reinterpret_cast<std::byte*>(view.candidate_counts) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) * sizeof(int);
+  if (reinterpret_cast<std::byte*>(view.candidate_indices) != base + offset) {
+    return false;
+  }
+  offset += static_cast<size_t>(seg_num) *
+            radix_topk::kCompactedCandidateCap * sizeof(int);
+  return offset == workspace_bytes;
 }
 
 bool check_gpu_small_correctness() {
@@ -253,6 +424,25 @@ bool check_gpu_small_correctness() {
   return true;
 }
 
+bool check_dispatch_policy() {
+  return radix_topk::histogram_ctas_per_segment(1) == 4 &&
+         radix_topk::histogram_ctas_per_segment(8) == 4 &&
+         radix_topk::histogram_ctas_per_segment(32) == 2 &&
+         radix_topk::histogram_ctas_per_segment(128) == 1;
+}
+
+bool check_partial_histogram_splitk_contract() {
+  return radix_topk::kPartialHistogramMaxCtasPerSegment == 4 &&
+         radix_topk::histogram_ctas_per_segment(1) <=
+             radix_topk::kPartialHistogramMaxCtasPerSegment &&
+         radix_topk::histogram_ctas_per_segment(8) <=
+             radix_topk::kPartialHistogramMaxCtasPerSegment &&
+         radix_topk::histogram_ctas_per_segment(32) <=
+             radix_topk::kPartialHistogramMaxCtasPerSegment &&
+         radix_topk::histogram_ctas_per_segment(128) <=
+             radix_topk::kPartialHistogramMaxCtasPerSegment;
+}
+
 std::vector<float> make_random_input(int seg_num, int seg_len, uint32_t seed) {
   std::mt19937 rng(seed);
   std::uniform_real_distribution<float> dist(-64.0f, 64.0f);
@@ -278,6 +468,455 @@ std::vector<float> make_duplicate_heavy_input(int seg_num, int seg_len) {
     }
   }
   return values;
+}
+
+float quantize_to_half_float(float value) {
+  return __half2float(__float2half(value));
+}
+
+std::vector<float> make_optimized_special_values_input(int seg_num, int seg_len) {
+  std::vector<float> values(static_cast<size_t>(seg_num) * seg_len);
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const size_t base = static_cast<size_t>(seg) * seg_len;
+    for (int i = 0; i < seg_len; ++i) {
+      values[base + static_cast<size_t>(i)] =
+          quantize_to_half_float(-512.0f + static_cast<float>((i + seg) % 113));
+    }
+
+    values[base + 3] = __half2float(__float2half(INFINITY));
+    values[base + 9] = __half2float(__float2half(INFINITY));
+    values[base + 15] = quantize_to_half_float(2048.0f - static_cast<float>(seg));
+    values[base + 21] = quantize_to_half_float(2048.0f - static_cast<float>(seg));
+    values[base + 27] = quantize_to_half_float(1024.0f + static_cast<float>(seg));
+    values[base + 33] = __half2float(__float2half(-INFINITY));
+    values[base + 39] = __half2float(__float2half(NAN));
+    values[base + 45] = __half2float(__float2half(NAN));
+  }
+  return values;
+}
+
+bool run_random_gpu_case(int seg_num, int seg_len, int k, uint32_t seed) {
+  const std::vector<float> host_values = make_random_input(seg_num, seg_len, seed);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  const size_t workspace_size =
+      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
+  half* d_input = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  void* d_workspace = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  const cudaError_t status = radix_topk::batch_topk_half(
+      d_input,
+      seg_num,
+      seg_len,
+      k,
+      d_output_values,
+      d_output_indices,
+      d_workspace,
+      workspace_size,
+      0);
+  std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
+  std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  std::vector<int> candidate_counts(seg_num, 0);
+  const auto workspace_view =
+      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
+  const bool ok = status == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(output_values.data(),
+                             d_output_values,
+                             sizeof(half) * output_values.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(output_indices.data(),
+                             d_output_indices,
+                             sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(candidate_counts.data(),
+                             workspace_view.candidate_counts,
+                             sizeof(int) * candidate_counts.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_workspace);
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_input);
+  if (!ok) {
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
+    const auto end = begin + seg_len;
+    const std::vector<float> segment(begin, end);
+    const radix_topk::ReferenceTopKResult expected =
+        radix_topk::cpu_reference_topk(segment, seg_len, k);
+    for (int i = 0; i < k; ++i) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        std::fprintf(stderr,
+                     "random case seed=%u shape=(%d,%d,%d) mismatch seg=%d rank=%d: got (%d, %.8g) expected (%d, %.8g)\n",
+                     seed,
+                     seg_num,
+                     seg_len,
+                     k,
+                     seg,
+                     i,
+                     actual_index,
+                     actual_value,
+                     expected.indices[i],
+                     expected.values[i]);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool check_gpu_small_batch_shapes() {
+  return run_random_gpu_case(1, 10000, 50, 7u) &&
+         run_random_gpu_case(8, 10000, 50, 17u) &&
+         run_random_gpu_case(32, 10000, 50, 23u);
+}
+
+bool check_final_topk50_kernel_ordering() {
+  const int seg_num = 1;
+  const int seg_len = radix_topk::kOptimizedCandidateCap;
+  std::vector<float> host_values(static_cast<size_t>(seg_len));
+  for (int i = 0; i < seg_len; ++i) {
+    host_values[static_cast<size_t>(i)] = quantize_to_half_float(-static_cast<float>(i));
+  }
+  host_values[0] = quantize_to_half_float(42.0f);
+  host_values[1] = quantize_to_half_float(42.0f);
+  host_values[2] = __half2float(__float2half(INFINITY));
+  host_values[3] = __half2float(__float2half(INFINITY));
+  host_values[4] = quantize_to_half_float(17.0f);
+  host_values[5] = quantize_to_half_float(17.0f);
+  host_values[6] = __half2float(__float2half(NAN));
+  host_values[7] = __half2float(__float2half(-INFINITY));
+
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+  std::vector<int> host_candidate_indices(radix_topk::kCompactedCandidateCap, 0);
+  for (int i = 0; i < radix_topk::kOptimizedCandidateCap; ++i) {
+    host_candidate_indices[static_cast<size_t>(i)] =
+        radix_topk::kOptimizedCandidateCap - 1 - i;
+  }
+  const int host_candidate_count = radix_topk::kOptimizedCandidateCap;
+
+  half* d_input = nullptr;
+  int* d_candidate_indices = nullptr;
+  int* d_candidate_counts = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_candidate_indices),
+                 sizeof(int) * host_candidate_indices.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_candidate_counts), sizeof(int)) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(radix_topk::kOptimizedK)) !=
+          cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(radix_topk::kOptimizedK)) !=
+          cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_candidate_indices,
+                 host_candidate_indices.data(),
+                 sizeof(int) * host_candidate_indices.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_candidate_counts,
+                 &host_candidate_count,
+                 sizeof(host_candidate_count),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_candidate_counts);
+    cudaFree(d_candidate_indices);
+    cudaFree(d_input);
+    return false;
+  }
+
+  radix_topk::final_topk50_kernel<<<seg_num, radix_topk::kOptimizedCandidateCap>>>(
+      d_input,
+      seg_len,
+      d_candidate_indices,
+      d_candidate_counts,
+      d_output_values,
+      d_output_indices);
+  std::vector<half> output_values(static_cast<size_t>(radix_topk::kOptimizedK));
+  std::vector<int> output_indices(static_cast<size_t>(radix_topk::kOptimizedK));
+  const bool ok = cudaGetLastError() == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(output_values.data(),
+                             d_output_values,
+                             sizeof(half) * output_values.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(output_indices.data(),
+                             d_output_indices,
+                             sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_candidate_counts);
+  cudaFree(d_candidate_indices);
+  cudaFree(d_input);
+  if (!ok) {
+    return false;
+  }
+
+  const radix_topk::ReferenceTopKResult expected =
+      radix_topk::cpu_reference_topk(host_values, seg_len, radix_topk::kOptimizedK);
+  for (int i = 0; i < radix_topk::kOptimizedK; ++i) {
+    const int actual_index = output_indices[static_cast<size_t>(i)];
+    const float actual_value = __half2float(output_values[static_cast<size_t>(i)]);
+    if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+      std::fprintf(stderr,
+                   "final_topk50 mismatch at rank %d: got (%d, %.8g) expected (%d, %.8g)\n",
+                   i,
+                   actual_index,
+                   actual_value,
+                   expected.indices[i],
+                   expected.values[i]);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool check_gpu_optimized_nan_inf_regression() {
+  const int seg_num = 2;
+  const int seg_len = 10000;
+  const int k = 50;
+  const std::vector<float> host_values = make_optimized_special_values_input(seg_num, seg_len);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  const size_t workspace_size =
+      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
+  half* d_input = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  void* d_workspace = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  const cudaError_t status = radix_topk::batch_topk_half(
+      d_input,
+      seg_num,
+      seg_len,
+      k,
+      d_output_values,
+      d_output_indices,
+      d_workspace,
+      workspace_size,
+      0);
+  std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
+  std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  std::vector<int> candidate_counts(seg_num, 0);
+  const auto workspace_view =
+      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
+  const bool ok = status == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(output_values.data(),
+                             d_output_values,
+                             sizeof(half) * output_values.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(output_indices.data(),
+                             d_output_indices,
+                             sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(candidate_counts.data(),
+                             workspace_view.candidate_counts,
+                             sizeof(int) * candidate_counts.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_workspace);
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_input);
+  if (!ok) {
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
+    const auto end = begin + seg_len;
+    const std::vector<float> segment(begin, end);
+    const radix_topk::ReferenceTopKResult expected =
+        radix_topk::cpu_reference_topk(segment, seg_len, k);
+    for (int i = 0; i < k; ++i) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        std::fprintf(stderr,
+                     "optimized NaN/Inf mismatch seg=%d rank=%d: got (%d, %.8g) expected (%d, %.8g)\n",
+                     seg,
+                     i,
+                     actual_index,
+                     actual_value,
+                     expected.indices[i],
+                     expected.values[i]);
+        return false;
+      }
+    }
+    if (candidate_counts[seg] != k) {
+      std::fprintf(stderr,
+                   "optimized NaN/Inf segment %d candidate count must equal k (%d), got %d\n",
+                   seg,
+                   k,
+                   candidate_counts[seg]);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool check_gpu_k128_correctness() {
+  const int seg_num = 3;
+  const int seg_len = 256;
+  const int k = 128;
+  const std::vector<float> host_values = make_random_input(seg_num, seg_len, 2026u);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  const size_t workspace_size =
+      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
+  half* d_input = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  void* d_workspace = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  const cudaError_t status = radix_topk::batch_topk_half(
+      d_input,
+      seg_num,
+      seg_len,
+      k,
+      d_output_values,
+      d_output_indices,
+      d_workspace,
+      workspace_size,
+      0);
+  std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
+  std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  std::vector<int> candidate_counts(seg_num, 0);
+  const auto workspace_view =
+      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
+  const bool ok = status == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(output_values.data(),
+                             d_output_values,
+                             sizeof(half) * output_values.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(output_indices.data(),
+                             d_output_indices,
+                             sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(candidate_counts.data(),
+                             workspace_view.candidate_counts,
+                             sizeof(int) * candidate_counts.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_workspace);
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_input);
+  if (!ok) {
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
+    const auto end = begin + seg_len;
+    const std::vector<float> segment(begin, end);
+    const radix_topk::ReferenceTopKResult expected =
+        radix_topk::cpu_reference_topk(segment, seg_len, k);
+    for (int i = 0; i < k; ++i) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        std::fprintf(stderr,
+                     "k128 segment %d mismatch at %d: got (%d, %.5f) expected (%d, %.5f)\n",
+                     seg,
+                     i,
+                     actual_index,
+                     actual_value,
+                     expected.indices[i],
+                     expected.values[i]);
+        return false;
+      }
+    }
+    if (candidate_counts[seg] != k) {
+      std::fprintf(stderr,
+                   "k128 segment %d candidate count must equal k (%d), got %d\n",
+                   seg,
+                   k,
+                   candidate_counts[seg]);
+      return false;
+    }
+  }
+  return true;
 }
 
 bool check_gpu_duplicate_heavy_k50() {
@@ -374,11 +1013,11 @@ bool check_gpu_duplicate_heavy_k50() {
         return false;
       }
     }
-    if (candidate_counts[seg] < k ||
-        candidate_counts[seg] > radix_topk::kCompactedCandidateCap) {
+    if (candidate_counts[seg] != k) {
       std::fprintf(stderr,
-                   "segment %d candidate count out of range: %d\n",
+                   "segment %d candidate count must equal k (%d), got %d\n",
                    seg,
+                   k,
                    candidate_counts[seg]);
       return false;
     }
@@ -489,6 +1128,14 @@ bool check_gpu_large_random_regression() {
         return false;
       }
     }
+    if (candidate_counts[seg] != k) {
+      std::fprintf(stderr,
+                   "random segment %d candidate count must equal k (%d), got %d\n",
+                   seg,
+                   k,
+                   candidate_counts[seg]);
+      return false;
+    }
   }
   return true;
 }
@@ -558,8 +1205,56 @@ int main() {
     std::fprintf(stderr, "benchmark target matrix is incorrect\n");
     return 1;
   }
+  if (!check_benchmark_measurement_contract()) {
+    std::fprintf(stderr, "benchmark measurement contract is incorrect\n");
+    return 1;
+  }
+  if (!check_optimized_state_contract()) {
+    std::fprintf(stderr, "optimized state contract is incorrect\n");
+    return 1;
+  }
+  if (!check_optimized_workspace_contract()) {
+    std::fprintf(stderr, "optimized workspace contract is incorrect\n");
+    return 1;
+  }
+  if (!check_optimized_workspace_layout_contract()) {
+    std::fprintf(stderr, "optimized workspace layout contract is incorrect\n");
+    return 1;
+  }
+  if (!check_gpu_cutoff_selection()) {
+    std::fprintf(stderr, "gpu cutoff selection check failed\n");
+    return 1;
+  }
+  if (!check_gpu_cutoff_selection_fallback()) {
+    std::fprintf(stderr, "gpu cutoff selection fallback check failed\n");
+    return 1;
+  }
   if (!check_gpu_small_correctness()) {
     std::fprintf(stderr, "gpu small correctness check failed\n");
+    return 1;
+  }
+  if (!check_dispatch_policy()) {
+    std::fprintf(stderr, "dispatch policy is incorrect\n");
+    return 1;
+  }
+  if (!check_partial_histogram_splitk_contract()) {
+    std::fprintf(stderr, "partial histogram split-k contract is incorrect\n");
+    return 1;
+  }
+  if (!check_gpu_small_batch_shapes()) {
+    std::fprintf(stderr, "gpu small batch shape check failed\n");
+    return 1;
+  }
+  if (!check_final_topk50_kernel_ordering()) {
+    std::fprintf(stderr, "final_topk50 ordering check failed\n");
+    return 1;
+  }
+  if (!check_gpu_optimized_nan_inf_regression()) {
+    std::fprintf(stderr, "gpu optimized NaN/Inf regression failed\n");
+    return 1;
+  }
+  if (!check_gpu_k128_correctness()) {
+    std::fprintf(stderr, "gpu k128 correctness check failed\n");
     return 1;
   }
   if (!check_gpu_duplicate_heavy_k50()) {
