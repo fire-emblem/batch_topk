@@ -12,7 +12,6 @@
 #include "../src/dispatch_policy.cuh"
 #include "../src/final_topk50.cuh"
 #include "../src/radix_boundary_select.cuh"
-#include "../src/radix_first_nibble_select.cuh"
 #include "../src/radix_histogram.cuh"
 #include "../src/radix_select_state.cuh"
 
@@ -267,7 +266,7 @@ radix_topk::SegmentSelectState simulate_first_nibble_select(
     state.prefix_mask = 0xffffu;
     state.selected_count = bounded_seg_len;
     state.live_count = 0;
-    state.boundary_digit = 15;
+    state.boundary_digit = 255;
     return state;
   }
 

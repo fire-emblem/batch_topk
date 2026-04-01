@@ -5,7 +5,6 @@
 #include "final_block_sort.cuh"
 #include "final_topk50.cuh"
 #include "radix_boundary_select.cuh"
-#include "radix_first_nibble_select.cuh"
 #include "radix_histogram.cuh"
 #include "radix_select_state.cuh"
 
@@ -33,53 +32,11 @@ static bool has_valid_arguments(const half* d_input,
   return workspace_bytes >= batch_topk_half_workspace_size(seg_num, seg_len, k);
 }
 
-static bool has_valid_first_nibble_round_arguments(const half* d_input,
-                                                   int seg_num,
-                                                   int seg_len,
-                                                   int k,
-                                                   void* d_workspace,
-                                                   size_t workspace_bytes) {
-  if (!is_supported_shape(seg_num, seg_len, k)) {
-    return false;
-  }
-  if (seg_len != kOptimizedSegLen || k != kOptimizedK) {
-    return false;
-  }
-  if (!d_input || !d_workspace) {
-    return false;
-  }
-  return workspace_bytes >= batch_topk_half_workspace_size(seg_num, seg_len, k);
-}
-
 size_t batch_topk_half_workspace_size(int seg_num, int seg_len, int k) {
   if (!is_supported_shape(seg_num, seg_len, k)) {
     return 0u;
   }
   return candidate_compaction_workspace_bytes(seg_num);
-}
-
-cudaError_t batch_topk_half_first_nibble_round_for_test(
-    const half* d_input,
-    int seg_num,
-    int seg_len,
-    int k,
-    void* d_workspace,
-    size_t workspace_bytes,
-    cudaStream_t stream) {
-  if (!has_valid_first_nibble_round_arguments(
-          d_input, seg_num, seg_len, k, d_workspace, workspace_bytes)) {
-    return cudaErrorInvalidValue;
-  }
-
-  const CandidateCompactionWorkspaceView workspace =
-      make_candidate_compaction_workspace(d_workspace, seg_num);
-  if (!workspace.states) {
-    return cudaErrorInvalidValue;
-  }
-
-  first_nibble_select_kernel<<<seg_num, 256, 0, stream>>>(
-      d_input, seg_len, k, workspace.states);
-  return cudaGetLastError();
 }
 
 cudaError_t batch_topk_half(const half* d_input,
@@ -119,21 +76,25 @@ cudaError_t batch_topk_half(const half* d_input,
       return cudaErrorInvalidValue;
     }
 
-    first_nibble_select_kernel<<<seg_num, 256, 0, stream>>>(
-        d_input, seg_len, k, workspace.states);
+    if (ctas_per_segment == 1) {
+      histogram_high_byte_topk50_kernel<<<seg_num, 256, 0, stream>>>(
+          d_input, seg_len, workspace.histograms_hi);
+    } else {
+      histogram_high_byte_splitk_kernel<<<seg_num * ctas_per_segment, 256, 0, stream>>>(
+          d_input, seg_num, seg_len, ctas_per_segment, workspace.partial_histograms);
+      status = cudaGetLastError();
+      if (status != cudaSuccess) {
+        return status;
+      }
+      reduce_partial_histograms_kernel<<<seg_num, 256, 0, stream>>>(
+          workspace.partial_histograms, seg_num, ctas_per_segment, workspace.histograms_hi);
+    }
     status = cudaGetLastError();
     if (status != cudaSuccess) {
       return status;
     }
 
-    histogram_second_nibble_kernel<<<seg_num, 256, 0, stream>>>(
-        d_input, seg_len, workspace.states, workspace.histograms_hi);
-    status = cudaGetLastError();
-    if (status != cudaSuccess) {
-      return status;
-    }
-
-    select_second_nibble_kernel<<<(seg_num + 127) / 128, 128, 0, stream>>>(
+    select_high_byte_boundary_kernel<<<(seg_num + 127) / 128, 128, 0, stream>>>(
         workspace.histograms_hi, seg_num, k, workspace.states);
     status = cudaGetLastError();
     if (status != cudaSuccess) {
