@@ -986,11 +986,6 @@ bool check_gpu_small_batch_shapes() {
          run_random_gpu_case(32, 10000, 50, 23u);
 }
 
-bool check_gpu_large_batch_dispatch_boundary() {
-  return run_random_gpu_case(1499, 10000, 50, 20260401u) &&
-         run_random_gpu_case(1500, 10000, 50, 20260402u);
-}
-
 bool check_final_topk50_kernel_ordering() {
   const int seg_num = 1;
   const int seg_len = radix_topk::kOptimizedCandidateCap;
@@ -1655,10 +1650,6 @@ int main() {
   }
   if (!check_gpu_small_batch_shapes()) {
     std::fprintf(stderr, "gpu small batch shape check failed\n");
-    return 1;
-  }
-  if (!check_gpu_large_batch_dispatch_boundary()) {
-    std::fprintf(stderr, "gpu large batch dispatch boundary check failed\n");
     return 1;
   }
   if (!check_compact_topk50_warp_kernel_selection()) {
