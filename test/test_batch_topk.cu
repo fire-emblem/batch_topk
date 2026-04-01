@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -493,6 +494,80 @@ std::vector<float> make_optimized_special_values_input(int seg_num, int seg_len)
     values[base + 45] = __half2float(__float2half(NAN));
   }
   return values;
+}
+
+bool check_compact_topk50_kernel_selection() {
+  const int seg_num = 1;
+  const int seg_len = 10000;
+  const int k = 50;
+  const std::vector<float> host_values = make_duplicate_heavy_input(seg_num, seg_len);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  radix_topk::SegmentSelectState host_state{};
+  if (!run_gpu_cutoff_selection(host_values, k, &host_state)) {
+    return false;
+  }
+
+  half* d_input = nullptr;
+  radix_topk::SegmentSelectState* d_state = nullptr;
+  int* d_candidate_indices = nullptr;
+  int* d_candidate_counts = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_state), sizeof(radix_topk::SegmentSelectState)) !=
+          cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_candidate_indices),
+                 sizeof(int) * static_cast<size_t>(radix_topk::kOptimizedCandidateCap)) !=
+          cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_candidate_counts), sizeof(int)) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_state,
+                 &host_state,
+                 sizeof(host_state),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_candidate_counts);
+    cudaFree(d_candidate_indices);
+    cudaFree(d_state);
+    cudaFree(d_input);
+    return false;
+  }
+
+  radix_topk::compact_candidate_indices_topk50_kernel<<<seg_num, 256>>>(
+      d_input, seg_len, d_state, d_candidate_indices, d_candidate_counts);
+  std::vector<int> candidate_indices(radix_topk::kOptimizedCandidateCap, -1);
+  int candidate_count = 0;
+  const bool ok =
+      cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
+      cudaMemcpy(candidate_indices.data(),
+                 d_candidate_indices,
+                 sizeof(int) * candidate_indices.size(),
+                 cudaMemcpyDeviceToHost) == cudaSuccess &&
+      cudaMemcpy(&candidate_count,
+                 d_candidate_counts,
+                 sizeof(candidate_count),
+                 cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_candidate_counts);
+  cudaFree(d_candidate_indices);
+  cudaFree(d_state);
+  cudaFree(d_input);
+  if (!ok || candidate_count != k) {
+    return false;
+  }
+
+  candidate_indices.resize(static_cast<size_t>(candidate_count));
+  std::sort(candidate_indices.begin(), candidate_indices.end());
+
+  const radix_topk::ReferenceTopKResult expected =
+      radix_topk::cpu_reference_topk(host_values, seg_len, k);
+  std::vector<int> expected_indices = expected.indices;
+  std::sort(expected_indices.begin(), expected_indices.end());
+  return candidate_indices == expected_indices;
 }
 
 bool run_random_gpu_case(int seg_num, int seg_len, int k, uint32_t seed) {
@@ -1243,6 +1318,10 @@ int main() {
   }
   if (!check_gpu_small_batch_shapes()) {
     std::fprintf(stderr, "gpu small batch shape check failed\n");
+    return 1;
+  }
+  if (!check_compact_topk50_kernel_selection()) {
+    std::fprintf(stderr, "compact topk50 kernel selection check failed\n");
     return 1;
   }
   if (!check_final_topk50_kernel_ordering()) {
