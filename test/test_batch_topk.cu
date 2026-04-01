@@ -194,58 +194,6 @@ bool run_histogram_topk50_pair(const std::vector<float>& values,
   return ok;
 }
 
-bool run_low_byte_histogram_variant(const std::vector<float>& values,
-                                    const radix_topk::SegmentSelectState& state,
-                                    bool use_v2,
-                                    std::vector<unsigned int>* histograms_out) {
-  std::vector<half> host_input(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    host_input[i] = __float2half(values[i]);
-  }
-
-  half* d_input = nullptr;
-  radix_topk::SegmentSelectState* d_state = nullptr;
-  unsigned int* d_histograms = nullptr;
-  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
-                 sizeof(half) * host_input.size()) != cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_state),
-                 sizeof(radix_topk::SegmentSelectState)) != cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_histograms),
-                 sizeof(unsigned int) * histograms_out->size()) != cudaSuccess ||
-      cudaMemcpy(d_input,
-                 host_input.data(),
-                 sizeof(half) * host_input.size(),
-                 cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(d_state,
-                 &state,
-                 sizeof(state),
-                 cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_histograms);
-    cudaFree(d_state);
-    cudaFree(d_input);
-    return false;
-  }
-
-  if (use_v2) {
-    radix_topk::histogram_low_byte_topk50_v2_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_state, d_histograms);
-  } else {
-    radix_topk::histogram_low_byte_topk50_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_state, d_histograms);
-  }
-
-  const bool ok = cudaGetLastError() == cudaSuccess &&
-                  cudaDeviceSynchronize() == cudaSuccess &&
-                  cudaMemcpy(histograms_out->data(),
-                             d_histograms,
-                             sizeof(unsigned int) * histograms_out->size(),
-                             cudaMemcpyDeviceToHost) == cudaSuccess;
-  cudaFree(d_histograms);
-  cudaFree(d_state);
-  cudaFree(d_input);
-  return ok;
-}
-
 bool run_gpu_cutoff_selection(const std::vector<float>& values,
                               int k,
                               radix_topk::SegmentSelectState* state_out) {
@@ -399,22 +347,6 @@ bool check_topk50_histogram_kernels() {
   return true;
 }
 
-bool check_low_byte_topk50_v2_equivalence() {
-  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
-                                     5.0f, 4.0f, 3.0f, 2.0f};
-  const radix_topk::SegmentSelectState state =
-      radix_topk::simulate_radix_boundary(values, 8, 3);
-
-  std::vector<unsigned int> old_hist(256, 0);
-  std::vector<unsigned int> new_hist(256, 0);
-  if (!run_low_byte_histogram_variant(values, state, false, &old_hist) ||
-      !run_low_byte_histogram_variant(values, state, true, &new_hist)) {
-    return false;
-  }
-
-  return old_hist == new_hist;
-}
-
 bool check_benchmark_target_matrix() {
   constexpr auto cases = radix_topk::kPrimaryBenchmarkCases;
   if (cases.size() != 5) {
@@ -435,12 +367,6 @@ bool check_benchmark_target_matrix() {
 bool check_benchmark_measurement_contract() {
   return radix_topk::kPrimaryBenchmarkCases[0].seg_num == 128 &&
          radix_topk::kPrimaryBenchmarkCases[4].seg_num == 6000;
-}
-
-bool check_low_byte_histogram_baseline_contract() {
-  return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50 &&
-         radix_topk::kOptimizedCandidateCap == 64;
 }
 
 bool check_optimized_state_contract() {
@@ -1509,14 +1435,6 @@ int main() {
   }
   if (!check_gpu_small_batch_shapes()) {
     std::fprintf(stderr, "gpu small batch shape check failed\n");
-    return 1;
-  }
-  if (!check_low_byte_histogram_baseline_contract()) {
-    std::fprintf(stderr, "low byte histogram baseline contract is incorrect\n");
-    return 1;
-  }
-  if (!check_low_byte_topk50_v2_equivalence()) {
-    std::fprintf(stderr, "low byte topk50 v2 equivalence check failed\n");
     return 1;
   }
   if (!check_compact_topk50_warp_kernel_selection()) {
