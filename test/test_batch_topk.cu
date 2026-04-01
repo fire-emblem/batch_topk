@@ -368,11 +368,19 @@ bool check_benchmark_target_matrix() {
       return false;
     }
   }
+  for (size_t i = 0; i < cases.size(); ++i) {
+    for (size_t j = i + 1; j < cases.size(); ++j) {
+      if (cases[i].seg_num == cases[j].seg_num) {
+        return false;
+      }
+    }
+  }
   return true;
 }
 
 bool run_benchmark_with_env(
     const std::vector<std::pair<std::string, std::string>>& env_vars,
+    int* exit_code,
     std::string* output) {
   char output_path[] = "/tmp/test_batch_topk_benchXXXXXX";
   const int output_fd = mkstemp(output_path);
@@ -409,7 +417,7 @@ bool run_benchmark_with_env(
 
   const std::string command =
       std::string("./build/bench_batch_topk > ") + output_path + " 2>&1";
-  const int exit_code = std::system(command.c_str());
+  *exit_code = std::system(command.c_str());
 
   for (auto it = saved_env_vars.rbegin(); it != saved_env_vars.rend(); ++it) {
     if (it->had_value) {
@@ -429,7 +437,7 @@ bool run_benchmark_with_env(
   buffer << output_stream.rdbuf();
   *output = buffer.str();
   std::remove(output_path);
-  return exit_code == 0;
+  return true;
 }
 
 size_t count_output_lines_with_tokens(
@@ -454,27 +462,54 @@ size_t count_output_lines_with_tokens(
 }
 
 bool check_benchmark_single_shape_control_contract() {
+  int exit_code = 0;
   std::string output;
-  if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_SEG_NUM", "128"}}, &output)) {
+  if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_SEG_NUM", "128"}}, &exit_code, &output)) {
     return false;
   }
 
-  return count_output_lines_with_tokens(output, {"seg_num=128", "latency_us="}) == 1 &&
+  return exit_code == 0 &&
+         count_output_lines_with_tokens(output, {"seg_num=128", "latency_us="}) == 1 &&
          count_output_lines_with_tokens(output, {"seg_num=", "latency_us="}) == 1;
 }
 
 bool check_benchmark_repeat_summary_control_contract() {
+  int exit_code = 0;
   std::string output;
   if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_SEG_NUM", "128"},
                                {"BATCH_TOPK_BENCH_REPEAT", "3"},
                                {"BATCH_TOPK_BENCH_PRINT_SUMMARY", "1"}},
+                              &exit_code,
                               &output)) {
     return false;
   }
 
-  return count_output_lines_with_tokens(output, {"seg_num=128", "latency_us="}) == 3 &&
+  return exit_code == 0 &&
+         count_output_lines_with_tokens(output, {"seg_num=128", "latency_us="}) == 3 &&
          count_output_lines_with_tokens(output, {"seg_num=", "latency_us="}) == 3 &&
          count_output_lines_with_tokens(output, {"median_us", "min_us", "max_us"}) == 1;
+}
+
+bool check_benchmark_invalid_seg_num_control_contract() {
+  int exit_code = 0;
+  std::string output;
+  if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_SEG_NUM", "abc"}}, &exit_code, &output)) {
+    return false;
+  }
+
+  return exit_code != 0 &&
+         output.find("invalid BATCH_TOPK_BENCH_SEG_NUM") != std::string::npos;
+}
+
+bool check_benchmark_invalid_repeat_control_contract() {
+  int exit_code = 0;
+  std::string output;
+  if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_REPEAT", "abc"}}, &exit_code, &output)) {
+    return false;
+  }
+
+  return exit_code != 0 &&
+         output.find("invalid BATCH_TOPK_BENCH_REPEAT") != std::string::npos;
 }
 
 bool check_stage_timing_contract() {
@@ -1521,6 +1556,14 @@ int main() {
   }
   if (!check_benchmark_repeat_summary_control_contract()) {
     std::fprintf(stderr, "benchmark repeat summary control contract is incorrect\n");
+    return 1;
+  }
+  if (!check_benchmark_invalid_seg_num_control_contract()) {
+    std::fprintf(stderr, "benchmark invalid seg_num control contract is incorrect\n");
+    return 1;
+  }
+  if (!check_benchmark_invalid_repeat_control_contract()) {
+    std::fprintf(stderr, "benchmark invalid repeat control contract is incorrect\n");
     return 1;
   }
   if (!check_stage_timing_contract()) {

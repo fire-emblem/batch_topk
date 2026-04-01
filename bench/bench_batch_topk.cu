@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 #include "../src/batch_topk_stage_timing.cuh"
@@ -9,18 +11,28 @@
 
 namespace {
 
-bool parse_int_env(const char* name, int* value_out) {
+enum class IntEnvParseResult {
+  kUnset,
+  kValid,
+  kInvalid,
+};
+
+IntEnvParseResult parse_int_env(const char* name, int* value_out) {
   const char* value = std::getenv(name);
-  if (value == nullptr || value[0] == '\0') {
-    return false;
+  if (value == nullptr) {
+    return IntEnvParseResult::kUnset;
   }
+
+  errno = 0;
   char* end = nullptr;
   const long parsed = std::strtol(value, &end, 10);
-  if (end == value || *end != '\0') {
-    return false;
+  if (value[0] == '\0' || end == value || *end != '\0' || errno == ERANGE ||
+      parsed < std::numeric_limits<int>::min() ||
+      parsed > std::numeric_limits<int>::max()) {
+    return IntEnvParseResult::kInvalid;
   }
   *value_out = static_cast<int>(parsed);
-  return true;
+  return IntEnvParseResult::kValid;
 }
 
 float median_latency_us(std::vector<float> values) {
@@ -196,15 +208,26 @@ bool run_benchmark_case(const radix_topk::BenchmarkCase& benchmark_case,
 int main() {
   const bool print_stage_timing = std::getenv("BATCH_TOPK_STAGE_TIMING") != nullptr;
   int selected_seg_num = 0;
-  const bool has_selected_seg_num =
+  const IntEnvParseResult seg_num_parse_result =
       parse_int_env("BATCH_TOPK_BENCH_SEG_NUM", &selected_seg_num);
+  if (seg_num_parse_result == IntEnvParseResult::kInvalid) {
+    std::fprintf(stderr,
+                 "invalid BATCH_TOPK_BENCH_SEG_NUM: %s\n",
+                 std::getenv("BATCH_TOPK_BENCH_SEG_NUM"));
+    return 1;
+  }
+  const bool has_selected_seg_num =
+      seg_num_parse_result == IntEnvParseResult::kValid;
 
   int repeat_count = 1;
-  if (parse_int_env("BATCH_TOPK_BENCH_REPEAT", &repeat_count)) {
-    if (repeat_count <= 0) {
-      std::fprintf(stderr, "invalid repeat count: %d\n", repeat_count);
-      return 1;
-    }
+  const IntEnvParseResult repeat_parse_result =
+      parse_int_env("BATCH_TOPK_BENCH_REPEAT", &repeat_count);
+  if (repeat_parse_result == IntEnvParseResult::kInvalid ||
+      (repeat_parse_result == IntEnvParseResult::kValid && repeat_count <= 0)) {
+    std::fprintf(stderr,
+                 "invalid BATCH_TOPK_BENCH_REPEAT: %s\n",
+                 std::getenv("BATCH_TOPK_BENCH_REPEAT"));
+    return 1;
   }
   const bool print_summary =
       std::getenv("BATCH_TOPK_BENCH_PRINT_SUMMARY") != nullptr;
