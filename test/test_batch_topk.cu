@@ -992,6 +992,10 @@ bool check_gpu_first_nibble_optimized_regression() {
   return true;
 }
 
+bool check_gpu_first_nibble_optimized_end_to_end_regression() {
+  return run_random_gpu_case(128, 10000, 50, 1234u);
+}
+
 bool check_final_topk50_kernel_ordering() {
   const int seg_num = 1;
   const int seg_len = radix_topk::kOptimizedCandidateCap;
@@ -1660,6 +1664,10 @@ int main() {
   }
   if (!check_gpu_first_nibble_optimized_regression()) {
     std::fprintf(stderr, "gpu first nibble optimized regression failed\n");
+    return 1;
+  }
+  if (!check_gpu_first_nibble_optimized_end_to_end_regression()) {
+    std::fprintf(stderr, "gpu first nibble optimized end-to-end regression failed\n");
     return 1;
   }
   if (!check_gpu_optimized_nan_inf_regression()) {
