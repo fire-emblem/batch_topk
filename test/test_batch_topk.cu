@@ -8,6 +8,7 @@
 #include "batch_topk_benchmark.cuh"
 #include "batch_topk.cuh"
 #include "batch_topk_types.cuh"
+#include "../src/batch_topk_stage_timing.cuh"
 #include "../src/candidate_compact.cuh"
 #include "../src/dispatch_policy.cuh"
 #include "../src/final_topk50.cuh"
@@ -367,6 +368,16 @@ bool check_benchmark_target_matrix() {
 bool check_benchmark_measurement_contract() {
   return radix_topk::kPrimaryBenchmarkCases[0].seg_num == 128 &&
          radix_topk::kPrimaryBenchmarkCases[4].seg_num == 6000;
+}
+
+bool check_stage_timing_contract() {
+  radix_topk::BatchTopkStageTiming timing{};
+  return timing.high_byte_hist_us == 0.0f &&
+         timing.high_byte_select_us == 0.0f &&
+         timing.low_byte_hist_us == 0.0f &&
+         timing.finalize_cutoff_us == 0.0f &&
+         timing.compaction_us == 0.0f &&
+         timing.final_topk_us == 0.0f;
 }
 
 bool check_optimized_state_contract() {
@@ -1399,6 +1410,10 @@ int main() {
   }
   if (!check_benchmark_measurement_contract()) {
     std::fprintf(stderr, "benchmark measurement contract is incorrect\n");
+    return 1;
+  }
+  if (!check_stage_timing_contract()) {
+    std::fprintf(stderr, "stage timing contract is incorrect\n");
     return 1;
   }
   if (!check_optimized_state_contract()) {
