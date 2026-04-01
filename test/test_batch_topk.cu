@@ -496,7 +496,7 @@ std::vector<float> make_optimized_special_values_input(int seg_num, int seg_len)
   return values;
 }
 
-bool check_compact_topk50_kernel_selection() {
+bool check_compact_topk50_warp_kernel_selection() {
   const int seg_num = 1;
   const int seg_len = 10000;
   const int k = 50;
@@ -538,7 +538,7 @@ bool check_compact_topk50_kernel_selection() {
     return false;
   }
 
-  radix_topk::compact_candidate_indices_topk50_kernel<<<seg_num, 256>>>(
+  radix_topk::compact_candidate_indices_topk50_warp_kernel<<<seg_num, 256>>>(
       d_input, seg_len, d_state, d_candidate_indices, d_candidate_counts);
   std::vector<int> candidate_indices(radix_topk::kOptimizedCandidateCap, -1);
   int candidate_count = 0;
@@ -1320,8 +1320,8 @@ int main() {
     std::fprintf(stderr, "gpu small batch shape check failed\n");
     return 1;
   }
-  if (!check_compact_topk50_kernel_selection()) {
-    std::fprintf(stderr, "compact topk50 kernel selection check failed\n");
+  if (!check_compact_topk50_warp_kernel_selection()) {
+    std::fprintf(stderr, "compact topk50 warp kernel selection check failed\n");
     return 1;
   }
   if (!check_final_topk50_kernel_ordering()) {

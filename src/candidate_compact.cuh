@@ -205,7 +205,7 @@ __global__ inline void compact_candidate_indices_kernel(const half* input,
   }
 }
 
-__global__ inline void compact_candidate_indices_topk50_kernel(
+__global__ inline void compact_candidate_indices_topk50_warp_kernel(
     const half* input,
     int seg_len,
     const SegmentSelectState* states,
@@ -225,18 +225,15 @@ __global__ inline void compact_candidate_indices_topk50_kernel(
   int* segment_candidates =
       candidate_indices + static_cast<size_t>(seg) * kCompactedCandidateCap;
 
-  __shared__ int better_written;
-  __shared__ int equal_written;
-  __shared__ int warp_better_counts[kCompactionWarpsPerBlock];
+  __shared__ int selected_written;
+  __shared__ int equal_seen;
   __shared__ int warp_equal_counts[kCompactionWarpsPerBlock];
-  __shared__ int warp_better_bases[kCompactionWarpsPerBlock];
   __shared__ int warp_equal_bases[kCompactionWarpsPerBlock];
-  __shared__ int tile_better_total;
-  __shared__ int tile_equal_total;
+  __shared__ int tile_equal_base;
 
   if (tid == 0) {
-    better_written = 0;
-    equal_written = 0;
+    selected_written = 0;
+    equal_seen = 0;
   }
   __syncthreads();
 
@@ -250,88 +247,64 @@ __global__ inline void compact_candidate_indices_topk50_kernel(
     const unsigned int better_mask = __ballot_sync(full_mask, better_flag);
     const unsigned int equal_mask = __ballot_sync(full_mask, equal_flag);
     const unsigned int lane_mask = (1u << lane) - 1u;
+    const int better_count = __popc(better_mask);
+    const int equal_count = __popc(equal_mask);
 
+    int warp_better_base = 0;
     if (lane == 0) {
-      warp_better_counts[warp] = __popc(better_mask);
-      warp_equal_counts[warp] = __popc(equal_mask);
+      if (better_count > 0) {
+        warp_better_base = atomicAdd(&selected_written, better_count);
+      }
+      warp_equal_counts[warp] = equal_count;
     }
+    warp_better_base = __shfl_sync(full_mask, warp_better_base, 0);
     __syncthreads();
 
     if (warp == 0 && lane < kCompactionWarpsPerBlock) {
-      int better_prefix = 0;
       int equal_prefix = 0;
       for (int i = 0; i < lane; ++i) {
-        better_prefix += warp_better_counts[i];
         equal_prefix += warp_equal_counts[i];
       }
-      warp_better_bases[lane] = better_prefix;
       warp_equal_bases[lane] = equal_prefix;
       if (lane == 0) {
-        tile_better_total = 0;
-        tile_equal_total = 0;
+        int tile_equal_total = 0;
         for (int i = 0; i < kCompactionWarpsPerBlock; ++i) {
-          tile_better_total += warp_better_counts[i];
           tile_equal_total += warp_equal_counts[i];
         }
+        tile_equal_base = equal_seen;
+        equal_seen += tile_equal_total;
       }
     }
     __syncthreads();
 
-    const int better_rank =
-        better_written + warp_better_bases[warp] + __popc(better_mask & lane_mask);
-    if (better_flag && better_rank < kCompactedCandidateCap) {
-      segment_candidates[better_rank] = idx;
+    if (better_flag) {
+      const int better_rank = __popc(better_mask & lane_mask);
+      const int output_slot = warp_better_base + better_rank;
+      if (output_slot < kCompactedCandidateCap) {
+        segment_candidates[output_slot] = idx;
+      }
     }
 
     const int equal_rank =
-        equal_written + warp_equal_bases[warp] + __popc(equal_mask & lane_mask);
-    const int output_slot = state.strictly_better_count + equal_rank;
-    if (equal_flag && equal_rank < state.remaining_slots &&
-        output_slot < kCompactedCandidateCap) {
-      segment_candidates[output_slot] = idx;
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-      better_written += tile_better_total;
-      equal_written += tile_equal_total;
+        tile_equal_base + warp_equal_bases[warp] + __popc(equal_mask & lane_mask);
+    if (equal_flag && equal_rank < state.remaining_slots) {
+      const int output_slot = atomicAdd(&selected_written, 1);
+      if (output_slot < kCompactedCandidateCap) {
+        segment_candidates[output_slot] = idx;
+      }
     }
     __syncthreads();
   }
 
   if (tid == 0) {
-    int better_slots = better_written;
-    if (better_slots < 0) {
-      better_slots = 0;
+    int total = selected_written;
+    if (total < 0) {
+      total = 0;
     }
-    if (better_slots > kCompactedCandidateCap) {
-      better_slots = kCompactedCandidateCap;
+    if (total > kCompactedCandidateCap) {
+      total = kCompactedCandidateCap;
     }
-
-    int equal_limit = state.remaining_slots;
-    if (equal_limit < 0) {
-      equal_limit = 0;
-    }
-    if (equal_limit > kCompactedCandidateCap - state.strictly_better_count) {
-      equal_limit = kCompactedCandidateCap - state.strictly_better_count;
-    }
-
-    int equal_slots = equal_written;
-    if (equal_slots < 0) {
-      equal_slots = 0;
-    }
-    if (equal_slots > equal_limit) {
-      equal_slots = equal_limit;
-    }
-
-    int safe_prefix = better_slots;
-    if (state.strictly_better_count <= safe_prefix) {
-      const int equal_end = state.strictly_better_count + equal_slots;
-      if (equal_end > safe_prefix) {
-        safe_prefix = equal_end;
-      }
-    }
-    candidate_counts[seg] = safe_prefix;
+    candidate_counts[seg] = total;
   }
 }
 
