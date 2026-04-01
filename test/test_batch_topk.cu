@@ -595,6 +595,29 @@ std::vector<float> make_duplicate_heavy_input(int seg_num, int seg_len) {
   return values;
 }
 
+float quantize_to_half_float(float value);
+
+std::vector<float> make_topk50_all_equal_input(int seg_len) {
+  return std::vector<float>(static_cast<size_t>(seg_len), quantize_to_half_float(5.0f));
+}
+
+std::vector<float> make_topk50_mixed_better_equal_input(int seg_len) {
+  std::vector<float> values(static_cast<size_t>(seg_len), quantize_to_half_float(100.0f));
+  constexpr int kBetterPrefix = 32;
+  for (int i = 0; i < kBetterPrefix; ++i) {
+    values[static_cast<size_t>(i)] = quantize_to_half_float(200.0f - static_cast<float>(i));
+  }
+  return values;
+}
+
+std::vector<int> make_sequential_indices(int count) {
+  std::vector<int> indices(static_cast<size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    indices[static_cast<size_t>(i)] = i;
+  }
+  return indices;
+}
+
 float quantize_to_half_float(float value) {
   return __half2float(__float2half(value));
 }
@@ -687,15 +710,22 @@ bool check_compact_topk50_warp_reserved_equivalence() {
   const int seg_len = 10000;
   const int k = 50;
 
-  const std::vector<std::vector<float>> cases = {
-      make_duplicate_heavy_input(1, seg_len),
-      std::vector<float>(static_cast<size_t>(seg_len),
-                         __half2float(__float2half(5.0f))),
+  struct CompactTopk50Case {
+    const char* name;
+    std::vector<float> values;
+    bool check_oracle;
+    std::vector<int> expected_indices;
   };
 
-  for (const std::vector<float>& values : cases) {
+  const std::vector<CompactTopk50Case> cases = {
+      {"duplicate-heavy", make_duplicate_heavy_input(1, seg_len), false, {}},
+      {"all-equal", make_topk50_all_equal_input(seg_len), true, make_sequential_indices(k)},
+      {"mixed-better-equal", make_topk50_mixed_better_equal_input(seg_len), false, {}},
+  };
+
+  for (const CompactTopk50Case& test_case : cases) {
     radix_topk::SegmentSelectState state{};
-    if (!run_gpu_cutoff_selection(values, k, &state)) {
+    if (!run_gpu_cutoff_selection(test_case.values, k, &state)) {
       return false;
     }
 
@@ -703,8 +733,8 @@ bool check_compact_topk50_warp_reserved_equivalence() {
     std::vector<int> new_indices(radix_topk::kCompactedCandidateCap, -1);
     int old_count = 0;
     int new_count = 0;
-    if (!run_compact_topk50_variant(values, state, false, &old_indices, &old_count) ||
-        !run_compact_topk50_variant(values, state, true, &new_indices, &new_count)) {
+    if (!run_compact_topk50_variant(test_case.values, state, false, &old_indices, &old_count) ||
+        !run_compact_topk50_variant(test_case.values, state, true, &new_indices, &new_count)) {
       return false;
     }
 
@@ -717,6 +747,20 @@ bool check_compact_topk50_warp_reserved_equivalence() {
     std::sort(new_indices.begin(), new_indices.end());
     if (old_indices != new_indices) {
       return false;
+    }
+
+    if (test_case.check_oracle) {
+      const radix_topk::ReferenceTopKResult expected =
+          radix_topk::cpu_reference_topk(test_case.values, seg_len, k);
+      if (expected.indices != test_case.expected_indices) {
+        return false;
+      }
+
+      std::vector<int> expected_sorted = expected.indices;
+      std::sort(expected_sorted.begin(), expected_sorted.end());
+      if (old_indices != expected_sorted || new_indices != expected_sorted) {
+        return false;
+      }
     }
   }
   return true;
