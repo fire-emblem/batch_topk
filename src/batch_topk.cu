@@ -132,6 +132,7 @@ cudaError_t batch_topk_half(const half* d_input,
 
   if (seg_len == kOptimizedSegLen && k == kOptimizedK) {
     const int ctas_per_segment = histogram_ctas_per_segment(seg_num);
+    const bool use_large_batch_hist = seg_num >= 1500;
     if (ctas_per_segment < 1 ||
         ctas_per_segment > kPartialHistogramMaxCtasPerSegment) {
       // partial_histograms is provisioned for at most 4 split CTAs per segment.
@@ -145,8 +146,13 @@ cudaError_t batch_topk_half(const half* d_input,
       return status;
     }
     if (ctas_per_segment == 1) {
-      histogram_high_byte_topk50_kernel<<<seg_num, 256, 0, stream>>>(
-          d_input, seg_len, workspace.histograms_hi);
+      if (use_large_batch_hist) {
+        histogram_high_byte_topk50_large_kernel<<<seg_num, 256, 0, stream>>>(
+            d_input, seg_len, workspace.histograms_hi);
+      } else {
+        histogram_high_byte_topk50_kernel<<<seg_num, 256, 0, stream>>>(
+            d_input, seg_len, workspace.histograms_hi);
+      }
     } else {
       histogram_high_byte_splitk_kernel<<<seg_num * ctas_per_segment, 256, 0, stream>>>(
           d_input, seg_num, seg_len, ctas_per_segment, workspace.partial_histograms);
@@ -193,8 +199,13 @@ cudaError_t batch_topk_half(const half* d_input,
       return status;
     }
     if (ctas_per_segment == 1) {
-      histogram_low_byte_topk50_kernel<<<seg_num, 256, 0, stream>>>(
-          d_input, seg_len, workspace.states, workspace.histograms_lo);
+      if (use_large_batch_hist) {
+        histogram_low_byte_topk50_large_kernel<<<seg_num, 256, 0, stream>>>(
+            d_input, seg_len, workspace.states, workspace.histograms_lo);
+      } else {
+        histogram_low_byte_topk50_kernel<<<seg_num, 256, 0, stream>>>(
+            d_input, seg_len, workspace.states, workspace.histograms_lo);
+      }
     } else {
       histogram_low_byte_splitk_kernel<<<seg_num * ctas_per_segment, 256, 0, stream>>>(
           d_input,
