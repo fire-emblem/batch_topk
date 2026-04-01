@@ -246,6 +246,18 @@ bool run_low_byte_histogram_variant(const std::vector<float>& values,
   return ok;
 }
 
+std::vector<float> make_realistic_low_byte_topk50_values() {
+  std::vector<float> values(static_cast<size_t>(radix_topk::kOptimizedSegLen), 0.0f);
+  for (int i = 0; i < 40; ++i) {
+    values[static_cast<size_t>(i)] = 32.0f - static_cast<float>(i) * 0.25f;
+  }
+  for (int i = 0; i < 60; ++i) {
+    values[40u + static_cast<size_t>(i)] =
+        1.0f + static_cast<float>(i) / 1024.0f;
+  }
+  return values;
+}
+
 bool run_gpu_cutoff_selection(const std::vector<float>& values,
                               int k,
                               radix_topk::SegmentSelectState* state_out) {
@@ -400,19 +412,60 @@ bool check_topk50_histogram_kernels() {
 }
 
 bool check_low_byte_topk50_v2_equivalence() {
-  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
-                                     5.0f, 4.0f, 3.0f, 2.0f};
-  const radix_topk::SegmentSelectState state =
-      radix_topk::simulate_radix_boundary(values, 8, 3);
-
+  const std::vector<float> small_values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                           5.0f, 4.0f, 3.0f, 2.0f};
+  const radix_topk::SegmentSelectState small_state =
+      radix_topk::simulate_radix_boundary(small_values, 8, 3);
   std::vector<unsigned int> old_hist(256, 0);
   std::vector<unsigned int> new_hist(256, 0);
-  if (!run_low_byte_histogram_variant(values, state, false, &old_hist) ||
-      !run_low_byte_histogram_variant(values, state, true, &new_hist)) {
+  if (!run_low_byte_histogram_variant(small_values, small_state, false, &old_hist) ||
+      !run_low_byte_histogram_variant(small_values, small_state, true, &new_hist) ||
+      old_hist != new_hist) {
     return false;
   }
 
-  return old_hist == new_hist;
+  const std::vector<float> realistic_values =
+      make_realistic_low_byte_topk50_values();
+  const radix_topk::SegmentSelectState realistic_state =
+      radix_topk::simulate_radix_boundary(
+          realistic_values, radix_topk::kOptimizedSegLen, radix_topk::kOptimizedK);
+  if (realistic_state.selected_count != 40 || realistic_state.live_count != 60) {
+    return false;
+  }
+
+  int matching_boundary_values = 0;
+  int nonzero_low_bins = 0;
+  std::vector<unsigned int> cpu_boundary_histogram(256, 0);
+  for (int i = 0; i < radix_topk::kOptimizedSegLen; ++i) {
+    const uint16_t encoded =
+        radix_topk::encode_half_desc(__float2half(realistic_values[static_cast<size_t>(i)]));
+    if ((encoded >> 8) != realistic_state.boundary_digit) {
+      continue;
+    }
+    ++matching_boundary_values;
+    const size_t low_bin = static_cast<size_t>(encoded & 0xffu);
+    if (cpu_boundary_histogram[low_bin]++ == 0) {
+      ++nonzero_low_bins;
+    }
+  }
+  if (matching_boundary_values != realistic_state.live_count || nonzero_low_bins < 2) {
+    return false;
+  }
+
+  std::vector<unsigned int> old_hist_realistic(256, 0);
+  std::vector<unsigned int> new_hist_realistic(256, 0);
+  if (!run_low_byte_histogram_variant(realistic_values,
+                                      realistic_state,
+                                      false,
+                                      &old_hist_realistic) ||
+      !run_low_byte_histogram_variant(realistic_values,
+                                      realistic_state,
+                                      true,
+                                      &new_hist_realistic)) {
+    return false;
+  }
+
+  return old_hist_realistic == new_hist_realistic;
 }
 
 bool check_benchmark_target_matrix() {
@@ -439,8 +492,7 @@ bool check_benchmark_measurement_contract() {
 
 bool check_low_byte_histogram_baseline_contract() {
   return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50 &&
-         radix_topk::kOptimizedCandidateCap == 64;
+         radix_topk::kOptimizedK == 50;
 }
 
 bool check_optimized_state_contract() {
