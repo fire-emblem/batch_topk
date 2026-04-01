@@ -102,7 +102,7 @@ cudaError_t batch_topk_half(const half* d_input,
     }
 
     if (ctas_per_segment == 1) {
-      histogram_low_byte_topk50_kernel<<<seg_num, 256, 0, stream>>>(
+      histogram_low_byte_topk50_v2_kernel<<<seg_num, 256, 0, stream>>>(
           d_input, seg_len, workspace.states, workspace.histograms_lo);
     } else {
       histogram_low_byte_splitk_kernel<<<seg_num * ctas_per_segment, 256, 0, stream>>>(

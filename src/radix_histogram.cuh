@@ -12,6 +12,46 @@ inline constexpr int kHistogramWarpSize = 32;
 inline constexpr int kHistogramWarpsPerBlock =
     kHistogramBlockThreads / kHistogramWarpSize;
 
+struct HistogramCacheEntry {
+  unsigned short bin = 0xffffu;
+  unsigned short count = 0u;
+};
+
+__device__ inline void flush_histogram_cache(HistogramCacheEntry* cache,
+                                             int cache_size,
+                                             unsigned int* warp_histogram) {
+  for (int i = 0; i < cache_size; ++i) {
+    if (cache[i].count != 0u) {
+      atomicAdd(&warp_histogram[cache[i].bin], static_cast<unsigned int>(cache[i].count));
+      cache[i].bin = 0xffffu;
+      cache[i].count = 0u;
+    }
+  }
+}
+
+__device__ inline void accumulate_histogram_cache(HistogramCacheEntry* cache,
+                                                  int cache_size,
+                                                  unsigned short bin,
+                                                  unsigned int* warp_histogram) {
+  for (int i = 0; i < cache_size; ++i) {
+    if (cache[i].count != 0u && cache[i].bin == bin) {
+      ++cache[i].count;
+      return;
+    }
+  }
+  for (int i = 0; i < cache_size; ++i) {
+    if (cache[i].count == 0u) {
+      cache[i].bin = bin;
+      cache[i].count = 1u;
+      return;
+    }
+  }
+
+  atomicAdd(&warp_histogram[cache[0].bin], static_cast<unsigned int>(cache[0].count));
+  cache[0].bin = bin;
+  cache[0].count = 1u;
+}
+
 __global__ inline void histogram_high_byte_topk50_kernel(const half* input,
                                                          int seg_len,
                                                          unsigned int* histograms_hi) {
@@ -65,6 +105,51 @@ __global__ inline void histogram_low_byte_topk50_kernel(const half* input,
       atomicAdd(&warp_histograms[warp][encoded & 0xffu], 1u);
     }
   }
+  __syncthreads();
+
+  unsigned int* segment_histogram =
+      histograms_lo + static_cast<size_t>(seg) * 256u;
+  for (int bin = tid; bin < 256; bin += blockDim.x) {
+    unsigned int total = 0;
+    for (int w = 0; w < kHistogramWarpsPerBlock; ++w) {
+      total += warp_histograms[w][bin];
+    }
+    segment_histogram[bin] = total;
+  }
+}
+
+__global__ inline void histogram_low_byte_topk50_v2_kernel(
+    const half* input,
+    int seg_len,
+    const SegmentSelectState* states,
+    unsigned int* histograms_lo) {
+  const int seg = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid / kHistogramWarpSize;
+  const SegmentSelectState state = states[seg];
+  const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
+
+  __shared__ unsigned int warp_histograms[kHistogramWarpsPerBlock][256];
+  for (int i = tid; i < kHistogramWarpsPerBlock * 256; i += blockDim.x) {
+    reinterpret_cast<unsigned int*>(warp_histograms)[i] = 0u;
+  }
+  __syncthreads();
+
+  HistogramCacheEntry cache[4];
+  for (int i = 0; i < 4; ++i) {
+    cache[i].bin = 0xffffu;
+    cache[i].count = 0u;
+  }
+
+  unsigned int* warp_histogram = warp_histograms[warp];
+  for (int i = tid; i < seg_len; i += blockDim.x) {
+    const uint16_t encoded = encode_half_desc(segment_input[i]);
+    if ((encoded >> 8) == state.boundary_digit) {
+      accumulate_histogram_cache(
+          cache, 4, static_cast<unsigned short>(encoded & 0xffu), warp_histogram);
+    }
+  }
+  flush_histogram_cache(cache, 4, warp_histogram);
   __syncthreads();
 
   unsigned int* segment_histogram =
