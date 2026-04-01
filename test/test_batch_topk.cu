@@ -1,9 +1,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
+#include <fstream>
 #include <random>
+#include <sstream>
+#include <string>
+#include <utility>
 #include <vector>
+#include <unistd.h>
 
 #include "batch_topk_benchmark.cuh"
 #include "batch_topk.cuh"
@@ -365,18 +371,110 @@ bool check_benchmark_target_matrix() {
   return true;
 }
 
-bool check_benchmark_measurement_contract() {
-  return radix_topk::kPrimaryBenchmarkCases[0].seg_num == 128 &&
-         radix_topk::kPrimaryBenchmarkCases[4].seg_num == 6000;
+bool run_benchmark_with_env(
+    const std::vector<std::pair<std::string, std::string>>& env_vars,
+    std::string* output) {
+  char output_path[] = "/tmp/test_batch_topk_benchXXXXXX";
+  const int output_fd = mkstemp(output_path);
+  if (output_fd == -1) {
+    return false;
+  }
+  close(output_fd);
+
+  struct SavedEnvVar {
+    std::string key;
+    bool had_value;
+    std::string value;
+  };
+
+  std::vector<SavedEnvVar> saved_env_vars;
+  saved_env_vars.reserve(env_vars.size());
+  for (const auto& env_var : env_vars) {
+    const char* const existing_value = std::getenv(env_var.first.c_str());
+    saved_env_vars.push_back(
+        {env_var.first, existing_value != nullptr,
+         existing_value == nullptr ? std::string() : std::string(existing_value)});
+    if (setenv(env_var.first.c_str(), env_var.second.c_str(), 1) != 0) {
+      for (auto it = saved_env_vars.rbegin(); it != saved_env_vars.rend(); ++it) {
+        if (it->had_value) {
+          setenv(it->key.c_str(), it->value.c_str(), 1);
+        } else {
+          unsetenv(it->key.c_str());
+        }
+      }
+      std::remove(output_path);
+      return false;
+    }
+  }
+
+  const std::string command =
+      std::string("./build/bench_batch_topk > ") + output_path + " 2>&1";
+  const int exit_code = std::system(command.c_str());
+
+  for (auto it = saved_env_vars.rbegin(); it != saved_env_vars.rend(); ++it) {
+    if (it->had_value) {
+      setenv(it->key.c_str(), it->value.c_str(), 1);
+    } else {
+      unsetenv(it->key.c_str());
+    }
+  }
+
+  std::ifstream output_stream(output_path);
+  if (!output_stream) {
+    std::remove(output_path);
+    return false;
+  }
+
+  std::ostringstream buffer;
+  buffer << output_stream.rdbuf();
+  *output = buffer.str();
+  std::remove(output_path);
+  return exit_code == 0;
 }
 
-bool check_benchmark_repeat_contract() {
-  constexpr auto cases = radix_topk::kPrimaryBenchmarkCases;
-  return cases.size() == 5 &&
-         cases[0].seg_len == 10000 &&
-         cases[0].k == 50 &&
-         cases[4].seg_len == 10000 &&
-         cases[4].k == 50;
+size_t count_output_lines_with_tokens(
+    const std::string& output,
+    std::initializer_list<const char*> tokens) {
+  size_t count = 0;
+  std::istringstream lines(output);
+  std::string line;
+  while (std::getline(lines, line)) {
+    bool matches = true;
+    for (const char* token : tokens) {
+      if (line.find(token) == std::string::npos) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool check_benchmark_single_shape_control_contract() {
+  std::string output;
+  if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_SEG_NUM", "128"}}, &output)) {
+    return false;
+  }
+
+  return count_output_lines_with_tokens(output, {"seg_num=128", "latency_us="}) == 1 &&
+         count_output_lines_with_tokens(output, {"seg_num=", "latency_us="}) == 1;
+}
+
+bool check_benchmark_repeat_summary_control_contract() {
+  std::string output;
+  if (!run_benchmark_with_env({{"BATCH_TOPK_BENCH_SEG_NUM", "128"},
+                               {"BATCH_TOPK_BENCH_REPEAT", "3"},
+                               {"BATCH_TOPK_BENCH_PRINT_SUMMARY", "1"}},
+                              &output)) {
+    return false;
+  }
+
+  return count_output_lines_with_tokens(output, {"seg_num=128", "latency_us="}) == 3 &&
+         count_output_lines_with_tokens(output, {"seg_num=", "latency_us="}) == 3 &&
+         count_output_lines_with_tokens(output, {"median_us", "min_us", "max_us"}) == 1;
 }
 
 bool check_stage_timing_contract() {
@@ -1417,12 +1515,12 @@ int main() {
     std::fprintf(stderr, "benchmark target matrix is incorrect\n");
     return 1;
   }
-  if (!check_benchmark_measurement_contract()) {
-    std::fprintf(stderr, "benchmark measurement contract is incorrect\n");
+  if (!check_benchmark_single_shape_control_contract()) {
+    std::fprintf(stderr, "benchmark single-shape control contract is incorrect\n");
     return 1;
   }
-  if (!check_benchmark_repeat_contract()) {
-    std::fprintf(stderr, "benchmark repeat contract is incorrect\n");
+  if (!check_benchmark_repeat_summary_control_contract()) {
+    std::fprintf(stderr, "benchmark repeat summary control contract is incorrect\n");
     return 1;
   }
   if (!check_stage_timing_contract()) {
