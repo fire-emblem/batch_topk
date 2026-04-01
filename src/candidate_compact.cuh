@@ -308,8 +308,6 @@ __global__ inline void compact_candidate_indices_topk50_warp_kernel(
   }
 }
 
-// This variant removes per-item atomics from the equal-to-cutoff path only; the
-// strictly-better path still reserves output ranges with a warp-level atomic.
 __global__ inline void compact_candidate_indices_topk50_no_atomic_kernel(
     const half* input,
     int seg_len,
