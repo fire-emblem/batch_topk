@@ -676,12 +676,21 @@ bool run_compact_topk50_variant(const std::vector<float>& values,
   return ok;
 }
 
-bool check_compact_topk50_no_atomic_equivalence() {
-  const int seg_len = 10000;
-  const int k = 50;
-  const std::vector<float> values = make_duplicate_heavy_input(1, seg_len);
+bool check_compact_topk50_no_atomic_equivalence_case(
+    const std::vector<float>& values,
+    int k,
+    int expected_strictly_better_count,
+    int expected_remaining_slots) {
   radix_topk::SegmentSelectState state{};
   if (!run_gpu_cutoff_selection(values, k, &state)) {
+    return false;
+  }
+  if (expected_strictly_better_count >= 0 &&
+      state.strictly_better_count != expected_strictly_better_count) {
+    return false;
+  }
+  if (expected_remaining_slots >= 0 &&
+      state.remaining_slots != expected_remaining_slots) {
     return false;
   }
 
@@ -693,13 +702,31 @@ bool check_compact_topk50_no_atomic_equivalence() {
       !run_compact_topk50_variant(values, state, true, &new_indices, &new_count)) {
     return false;
   }
-
   if (old_count != new_count) {
     return false;
   }
+
   old_indices.resize(static_cast<size_t>(old_count));
   new_indices.resize(static_cast<size_t>(new_count));
+  std::sort(old_indices.begin(), old_indices.end());
+  std::sort(new_indices.begin(), new_indices.end());
   return old_indices == new_indices;
+}
+
+bool check_compact_topk50_no_atomic_equivalence() {
+  const int seg_len = 10000;
+  const int k = 50;
+  const std::vector<float> duplicate_heavy_values =
+      make_duplicate_heavy_input(1, seg_len);
+  std::vector<float> equal_only_values(static_cast<size_t>(seg_len));
+  for (float& value : equal_only_values) {
+    value = quantize_to_half_float(3.0f);
+  }
+
+  return check_compact_topk50_no_atomic_equivalence_case(
+             duplicate_heavy_values, k, -1, -1) &&
+         check_compact_topk50_no_atomic_equivalence_case(
+             equal_only_values, k, 0, k);
 }
 
 bool check_compaction_no_atomic_baseline_contract() {
