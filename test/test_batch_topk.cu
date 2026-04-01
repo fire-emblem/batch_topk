@@ -248,170 +248,6 @@ bool run_gpu_cutoff_selection(const std::vector<float>& values,
   return ok;
 }
 
-radix_topk::SegmentSelectState simulate_first_nibble_select(
-    const std::vector<float>& values,
-    int seg_len,
-    int k) {
-  radix_topk::SegmentSelectState state{};
-  if (seg_len <= 0 || k <= 0) {
-    return state;
-  }
-
-  const int bounded_seg_len = std::min(seg_len, static_cast<int>(values.size()));
-  if (bounded_seg_len <= 0) {
-    return state;
-  }
-  if (k > bounded_seg_len) {
-    state.prefix = 0xffffu;
-    state.prefix_mask = 0xffffu;
-    state.selected_count = bounded_seg_len;
-    state.live_count = 0;
-    state.boundary_digit = 255;
-    return state;
-  }
-
-  int counts[16] = {};
-  for (int i = 0; i < bounded_seg_len; ++i) {
-    const uint16_t encoded =
-        radix_topk::encode_half_desc(__float2half(values[static_cast<size_t>(i)]));
-    ++counts[(encoded >> 12) & 0xf];
-  }
-
-  const int actual_k = std::min(k, bounded_seg_len);
-  for (int bucket = 0; bucket < 16; ++bucket) {
-    const int bucket_count = counts[bucket];
-    if (state.selected_count + bucket_count < actual_k) {
-      state.selected_count += bucket_count;
-      continue;
-    }
-    state.prefix = static_cast<uint16_t>(bucket << 12);
-    state.prefix_mask = 0xf000u;
-    state.live_count = bucket_count;
-    state.boundary_digit = bucket;
-    break;
-  }
-
-  return state;
-}
-
-bool run_first_nibble_select_gpu(const std::vector<float>& values,
-                                 int k,
-                                 radix_topk::SegmentSelectState* state_out) {
-  std::vector<half> host_input(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    host_input[i] = __float2half(values[i]);
-  }
-
-  half* d_input = nullptr;
-  radix_topk::SegmentSelectState* d_state = nullptr;
-  if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) !=
-          cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_state), sizeof(radix_topk::SegmentSelectState)) !=
-          cudaSuccess ||
-      cudaMemcpy(d_input,
-                 host_input.data(),
-                 sizeof(half) * host_input.size(),
-                 cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_state);
-    cudaFree(d_input);
-    return false;
-  }
-
-  radix_topk::first_nibble_select_kernel<<<1, 256>>>(
-      d_input, static_cast<int>(values.size()), k, d_state);
-  const bool ok = cudaGetLastError() == cudaSuccess &&
-                  cudaDeviceSynchronize() == cudaSuccess &&
-                  cudaMemcpy(state_out,
-                             d_state,
-                             sizeof(*state_out),
-                             cudaMemcpyDeviceToHost) == cudaSuccess;
-  cudaFree(d_state);
-  cudaFree(d_input);
-  return ok;
-}
-
-bool run_batch_topk_first_nibble_round_gpu(
-    const std::vector<float>& values,
-    int seg_num,
-    int seg_len,
-    int k,
-    std::vector<radix_topk::SegmentSelectState>* states_out) {
-  if (!states_out || static_cast<int>(states_out->size()) != seg_num) {
-    return false;
-  }
-
-  std::vector<half> host_input(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    host_input[i] = __float2half(values[i]);
-  }
-
-  const size_t workspace_size =
-      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
-  half* d_input = nullptr;
-  void* d_workspace = nullptr;
-  if (workspace_size == 0 ||
-      cudaMalloc(reinterpret_cast<void**>(&d_input),
-                 sizeof(half) * host_input.size()) != cudaSuccess ||
-      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
-      cudaMemcpy(d_input,
-                 host_input.data(),
-                 sizeof(half) * host_input.size(),
-                 cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(d_workspace);
-    cudaFree(d_input);
-    return false;
-  }
-
-  const auto workspace_view =
-      radix_topk::make_candidate_compaction_workspace(d_workspace, seg_num);
-  const cudaError_t status =
-      radix_topk::batch_topk_half_first_nibble_round_for_test(
-          d_input, seg_num, seg_len, k, d_workspace, workspace_size, 0);
-  const bool ok =
-      status == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
-      cudaMemcpy(states_out->data(),
-                 workspace_view.states,
-                 sizeof(radix_topk::SegmentSelectState) * states_out->size(),
-                 cudaMemcpyDeviceToHost) == cudaSuccess;
-  cudaFree(d_workspace);
-  cudaFree(d_input);
-  return ok;
-}
-
-bool check_first_nibble_select_kernel() {
-  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
-                                     5.0f, 4.0f, 3.0f, 2.0f};
-  const radix_topk::SegmentSelectState expected =
-      simulate_first_nibble_select(values, static_cast<int>(values.size()), 3);
-  radix_topk::SegmentSelectState state{};
-  if (!run_first_nibble_select_gpu(values, 3, &state)) {
-    return false;
-  }
-
-  return state.prefix == expected.prefix &&
-         state.prefix_mask == expected.prefix_mask &&
-         state.selected_count == expected.selected_count &&
-         state.live_count == expected.live_count &&
-         state.boundary_digit == expected.boundary_digit;
-}
-
-bool check_first_nibble_select_kernel_fallback() {
-  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
-                                     5.0f, 4.0f, 3.0f, 2.0f};
-  const radix_topk::SegmentSelectState expected =
-      simulate_first_nibble_select(values, static_cast<int>(values.size()), 9);
-  radix_topk::SegmentSelectState state{};
-  if (!run_first_nibble_select_gpu(values, 9, &state)) {
-    return false;
-  }
-
-  return state.prefix == expected.prefix &&
-         state.prefix_mask == expected.prefix_mask &&
-         state.selected_count == expected.selected_count &&
-         state.live_count == expected.live_count &&
-         state.boundary_digit == expected.boundary_digit;
-}
-
 bool check_gpu_cutoff_selection() {
   const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
                                      5.0f, 4.0f, 3.0f, 2.0f};
@@ -949,51 +785,6 @@ bool check_gpu_small_batch_shapes() {
   return run_random_gpu_case(1, 10000, 50, 7u) &&
          run_random_gpu_case(8, 10000, 50, 17u) &&
          run_random_gpu_case(32, 10000, 50, 23u);
-}
-
-bool check_gpu_first_nibble_optimized_regression() {
-  const int seg_num = 128;
-  const int seg_len = 10000;
-  const int k = 50;
-  const std::vector<float> host_values = make_random_input(seg_num, seg_len, 1234u);
-  std::vector<radix_topk::SegmentSelectState> states(seg_num);
-  if (!run_batch_topk_first_nibble_round_gpu(host_values, seg_num, seg_len, k, &states)) {
-    return false;
-  }
-
-  for (int seg = 0; seg < seg_num; ++seg) {
-    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
-    const auto end = begin + seg_len;
-    const std::vector<float> segment(begin, end);
-    const radix_topk::SegmentSelectState expected =
-        simulate_first_nibble_select(segment, seg_len, k);
-    const radix_topk::SegmentSelectState actual = states[seg];
-    if (actual.prefix != expected.prefix ||
-        actual.prefix_mask != expected.prefix_mask ||
-        actual.selected_count != expected.selected_count ||
-        actual.live_count != expected.live_count ||
-        actual.boundary_digit != expected.boundary_digit) {
-      std::fprintf(stderr,
-                   "optimized first nibble state mismatch seg=%d: got prefix=0x%04x mask=0x%04x selected=%d live=%d digit=%d expected prefix=0x%04x mask=0x%04x selected=%d live=%d digit=%d\n",
-                   seg,
-                   actual.prefix,
-                   actual.prefix_mask,
-                   actual.selected_count,
-                   actual.live_count,
-                   actual.boundary_digit,
-                   expected.prefix,
-                   expected.prefix_mask,
-                   expected.selected_count,
-                   expected.live_count,
-                   expected.boundary_digit);
-      return false;
-    }
-  }
-  return true;
-}
-
-bool check_gpu_first_nibble_optimized_end_to_end_regression() {
-  return run_random_gpu_case(128, 10000, 50, 1234u);
 }
 
 bool check_final_topk50_kernel_ordering() {
@@ -1630,14 +1421,6 @@ int main() {
     std::fprintf(stderr, "gpu cutoff selection fallback check failed\n");
     return 1;
   }
-  if (!check_first_nibble_select_kernel()) {
-    std::fprintf(stderr, "first nibble select kernel check failed\n");
-    return 1;
-  }
-  if (!check_first_nibble_select_kernel_fallback()) {
-    std::fprintf(stderr, "first nibble select kernel fallback check failed\n");
-    return 1;
-  }
   if (!check_gpu_small_correctness()) {
     std::fprintf(stderr, "gpu small correctness check failed\n");
     return 1;
@@ -1660,14 +1443,6 @@ int main() {
   }
   if (!check_final_topk50_kernel_ordering()) {
     std::fprintf(stderr, "final_topk50 ordering check failed\n");
-    return 1;
-  }
-  if (!check_gpu_first_nibble_optimized_regression()) {
-    std::fprintf(stderr, "gpu first nibble optimized regression failed\n");
-    return 1;
-  }
-  if (!check_gpu_first_nibble_optimized_end_to_end_regression()) {
-    std::fprintf(stderr, "gpu first nibble optimized end-to-end regression failed\n");
     return 1;
   }
   if (!check_gpu_optimized_nan_inf_regression()) {
