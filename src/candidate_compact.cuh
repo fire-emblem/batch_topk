@@ -308,4 +308,119 @@ __global__ inline void compact_candidate_indices_topk50_warp_kernel(
   }
 }
 
+__global__ inline void compact_candidate_indices_topk50_warp_reserved_equal_kernel(
+    const half* input,
+    int seg_len,
+    const SegmentSelectState* states,
+    int* candidate_indices,
+    int* candidate_counts) {
+  static_assert(kOptimizedK <= kOptimizedCandidateCap,
+                "topk50 compaction expects enough optimized candidate capacity");
+
+  const int seg = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & (kCompactionWarpSize - 1);
+  const int warp = tid / kCompactionWarpSize;
+  const unsigned int full_mask = 0xffffffffu;
+
+  const SegmentSelectState state = states[seg];
+  const half* segment_input = input + static_cast<size_t>(seg) * seg_len;
+  int* segment_candidates =
+      candidate_indices + static_cast<size_t>(seg) * kCompactedCandidateCap;
+
+  __shared__ int selected_written;
+  __shared__ int equal_seen;
+  __shared__ int warp_equal_counts[kCompactionWarpsPerBlock];
+  __shared__ int warp_equal_bases[kCompactionWarpsPerBlock];
+  __shared__ int tile_equal_base;
+
+  if (tid == 0) {
+    selected_written = 0;
+    equal_seen = 0;
+  }
+  __syncthreads();
+
+  for (int base = 0; base < seg_len; base += blockDim.x) {
+    const int idx = base + tid;
+    const bool in_range = idx < seg_len;
+    const uint16_t key = in_range ? encode_half_desc(segment_input[idx]) : 0xffffu;
+
+    const bool better_flag = in_range && key < state.cutoff_key;
+    const bool equal_flag = in_range && key == state.cutoff_key;
+    const unsigned int better_mask = __ballot_sync(full_mask, better_flag);
+    const unsigned int equal_mask = __ballot_sync(full_mask, equal_flag);
+    const unsigned int lane_mask = (1u << lane) - 1u;
+    const int better_count = __popc(better_mask);
+    const int equal_count = __popc(equal_mask);
+
+    int warp_better_base = 0;
+    if (lane == 0) {
+      if (better_count > 0) {
+        warp_better_base = atomicAdd(&selected_written, better_count);
+      }
+      warp_equal_counts[warp] = equal_count;
+    }
+    warp_better_base = __shfl_sync(full_mask, warp_better_base, 0);
+    __syncthreads();
+
+    if (warp == 0 && lane < kCompactionWarpsPerBlock) {
+      int equal_prefix = 0;
+      for (int i = 0; i < lane; ++i) {
+        equal_prefix += warp_equal_counts[i];
+      }
+      warp_equal_bases[lane] = equal_prefix;
+      if (lane == 0) {
+        int tile_equal_total = 0;
+        for (int i = 0; i < kCompactionWarpsPerBlock; ++i) {
+          tile_equal_total += warp_equal_counts[i];
+        }
+        tile_equal_base = equal_seen;
+        equal_seen += tile_equal_total;
+      }
+    }
+    __syncthreads();
+
+    if (better_flag) {
+      const int better_rank = __popc(better_mask & lane_mask);
+      const int output_slot = warp_better_base + better_rank;
+      if (output_slot < kCompactedCandidateCap) {
+        segment_candidates[output_slot] = idx;
+      }
+    }
+
+    const int equal_rank =
+        tile_equal_base + warp_equal_bases[warp] + __popc(equal_mask & lane_mask);
+    const bool accepted_equal = equal_flag && equal_rank < state.remaining_slots;
+    const unsigned int accepted_equal_mask =
+        __ballot_sync(full_mask, accepted_equal);
+    const int accepted_equal_count = __popc(accepted_equal_mask);
+
+    int warp_equal_write_base = 0;
+    if (lane == 0 && accepted_equal_count > 0) {
+      warp_equal_write_base = atomicAdd(&selected_written, accepted_equal_count);
+    }
+    warp_equal_write_base = __shfl_sync(full_mask, warp_equal_write_base, 0);
+
+    if (accepted_equal) {
+      const int accepted_equal_rank = __popc(accepted_equal_mask & lane_mask);
+      const int output_slot = warp_equal_write_base + accepted_equal_rank;
+      if (output_slot < kCompactedCandidateCap) {
+        segment_candidates[output_slot] = idx;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    int total = selected_written;
+    if (total < 0) {
+      total = 0;
+    }
+    if (total > kCompactedCandidateCap) {
+      total = kCompactedCandidateCap;
+    }
+    candidate_counts[seg] = total;
+  }
+}
+
 }  // namespace radix_topk

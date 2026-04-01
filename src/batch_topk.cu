@@ -245,7 +245,7 @@ cudaError_t batch_topk_half(const half* d_input,
       cleanup_stage_timing();
       return status;
     }
-    compact_candidate_indices_topk50_warp_kernel<<<seg_num, 256, 0, stream>>>(
+    compact_candidate_indices_topk50_warp_reserved_equal_kernel<<<seg_num, 256, 0, stream>>>(
         d_input, seg_len, workspace.states, workspace.candidate_indices,
         workspace.candidate_counts);
     status = cudaGetLastError();
