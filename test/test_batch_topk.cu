@@ -533,7 +533,110 @@ bool check_large_batch_low_histogram_equivalence() {
 
 bool check_large_batch_histogram_baseline_contract() {
   return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50;
+         radix_topk::kOptimizedK == 50 &&
+         radix_topk::kLargeBatchHistogramSampleWidth == 4;
+}
+
+bool run_dispatch_boundary_gpu_case(int seg_num, int seg_len, int k, uint32_t seed) {
+  const std::vector<float> host_values = make_random_input(seg_num, seg_len, seed);
+  std::vector<half> host_input(host_values.size());
+  for (size_t i = 0; i < host_values.size(); ++i) {
+    host_input[i] = __float2half(host_values[i]);
+  }
+
+  const size_t workspace_size =
+      radix_topk::batch_topk_half_workspace_size(seg_num, seg_len, k);
+  half* d_input = nullptr;
+  half* d_output_values = nullptr;
+  int* d_output_indices = nullptr;
+  void* d_workspace = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_values),
+                 sizeof(half) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_output_indices),
+                 sizeof(int) * static_cast<size_t>(seg_num) * k) != cudaSuccess ||
+      cudaMalloc(&d_workspace, workspace_size) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_workspace);
+    cudaFree(d_output_indices);
+    cudaFree(d_output_values);
+    cudaFree(d_input);
+    return false;
+  }
+
+  const cudaError_t status = radix_topk::batch_topk_half(
+      d_input,
+      seg_num,
+      seg_len,
+      k,
+      d_output_values,
+      d_output_indices,
+      d_workspace,
+      workspace_size,
+      0);
+  std::vector<half> output_values(static_cast<size_t>(seg_num) * k);
+  std::vector<int> output_indices(static_cast<size_t>(seg_num) * k);
+  const bool ok = status == cudaSuccess &&
+                  cudaDeviceSynchronize() == cudaSuccess &&
+                  cudaMemcpy(output_values.data(),
+                             d_output_values,
+                             sizeof(half) * output_values.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(output_indices.data(),
+                             d_output_indices,
+                             sizeof(int) * output_indices.size(),
+                             cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_workspace);
+  cudaFree(d_output_indices);
+  cudaFree(d_output_values);
+  cudaFree(d_input);
+  if (!ok) {
+    std::fprintf(stderr,
+                 "dispatch boundary runtime failure seed=%u shape=(%d,%d,%d)\n",
+                 seed,
+                 seg_num,
+                 seg_len,
+                 k);
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const auto begin = host_values.begin() + static_cast<size_t>(seg) * seg_len;
+    const auto end = begin + seg_len;
+    const std::vector<float> segment(begin, end);
+    const radix_topk::ReferenceTopKResult expected =
+        radix_topk::cpu_reference_topk(segment, seg_len, k);
+    for (int i = 0; i < k; ++i) {
+      const int actual_index = output_indices[static_cast<size_t>(seg) * k + i];
+      const float actual_value =
+          __half2float(output_values[static_cast<size_t>(seg) * k + i]);
+      if (actual_index != expected.indices[i] || actual_value != expected.values[i]) {
+        std::fprintf(stderr,
+                     "dispatch boundary seed=%u shape=(%d,%d,%d) mismatch seg=%d rank=%d: got (%d, %.8g) expected (%d, %.8g)\n",
+                     seed,
+                     seg_num,
+                     seg_len,
+                     k,
+                     seg,
+                     i,
+                     actual_index,
+                     actual_value,
+                     expected.indices[i],
+                     expected.values[i]);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool check_large_batch_dispatch_boundary() {
+  return run_dispatch_boundary_gpu_case(1499, 10000, 50, 20260402u) &&
+         run_dispatch_boundary_gpu_case(1500, 10000, 50, 20260403u);
 }
 
 bool check_benchmark_target_matrix() {
@@ -1602,6 +1705,10 @@ int main() {
   }
   if (!check_large_batch_low_histogram_equivalence()) {
     std::fprintf(stderr, "large batch low histogram equivalence check failed\n");
+    return 1;
+  }
+  if (!check_large_batch_dispatch_boundary()) {
+    std::fprintf(stderr, "large batch dispatch boundary check failed\n");
     return 1;
   }
   if (!check_benchmark_target_matrix()) {

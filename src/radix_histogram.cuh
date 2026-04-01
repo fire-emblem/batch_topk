@@ -11,12 +11,15 @@ inline constexpr int kHistogramBlockThreads = 256;
 inline constexpr int kHistogramWarpSize = 32;
 inline constexpr int kHistogramWarpsPerBlock =
     kHistogramBlockThreads / kHistogramWarpSize;
+inline constexpr int kLargeBatchHistogramSampleWidth = 4;
 
 struct HistogramMergeEntry {
   unsigned short bin = 0xffffu;
   unsigned short count = 0u;
 };
 
+// This helper is intentionally specialized for the fixed 4-sample large-batch
+// histogram kernels; slot 0 is the overflow merge target.
 __device__ inline void merge_histogram_samples(HistogramMergeEntry* entries,
                                                int entries_count,
                                                unsigned short bin) {
@@ -85,19 +88,22 @@ __global__ inline void histogram_high_byte_topk50_large_kernel(
   __syncthreads();
 
   unsigned int* warp_histogram = warp_histograms[warp];
-  for (int base = tid; base < seg_len; base += blockDim.x * 4) {
-    HistogramMergeEntry entries[4] = {};
+  for (int base = tid; base < seg_len;
+       base += blockDim.x * kLargeBatchHistogramSampleWidth) {
+    HistogramMergeEntry entries[kLargeBatchHistogramSampleWidth] = {};
 #pragma unroll
-    for (int item = 0; item < 4; ++item) {
+    for (int item = 0; item < kLargeBatchHistogramSampleWidth; ++item) {
       const int idx = base + item * blockDim.x;
       if (idx < seg_len) {
         const uint16_t encoded = encode_half_desc(segment_input[idx]);
         merge_histogram_samples(
-            entries, 4, static_cast<unsigned short>((encoded >> 8) & 0xffu));
+            entries,
+            kLargeBatchHistogramSampleWidth,
+            static_cast<unsigned short>((encoded >> 8) & 0xffu));
       }
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kLargeBatchHistogramSampleWidth; ++i) {
       if (entries[i].count != 0u) {
         atomicAdd(&warp_histogram[entries[i].bin],
                   static_cast<unsigned int>(entries[i].count));
@@ -170,21 +176,24 @@ __global__ inline void histogram_low_byte_topk50_large_kernel(
   __syncthreads();
 
   unsigned int* warp_histogram = warp_histograms[warp];
-  for (int base = tid; base < seg_len; base += blockDim.x * 4) {
-    HistogramMergeEntry entries[4] = {};
+  for (int base = tid; base < seg_len;
+       base += blockDim.x * kLargeBatchHistogramSampleWidth) {
+    HistogramMergeEntry entries[kLargeBatchHistogramSampleWidth] = {};
 #pragma unroll
-    for (int item = 0; item < 4; ++item) {
+    for (int item = 0; item < kLargeBatchHistogramSampleWidth; ++item) {
       const int idx = base + item * blockDim.x;
       if (idx < seg_len) {
         const uint16_t encoded = encode_half_desc(segment_input[idx]);
         if ((encoded >> 8) == state.boundary_digit) {
           merge_histogram_samples(
-              entries, 4, static_cast<unsigned short>(encoded & 0xffu));
+              entries,
+              kLargeBatchHistogramSampleWidth,
+              static_cast<unsigned short>(encoded & 0xffu));
         }
       }
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kLargeBatchHistogramSampleWidth; ++i) {
       if (entries[i].count != 0u) {
         atomicAdd(&warp_histogram[entries[i].bin],
                   static_cast<unsigned int>(entries[i].count));
