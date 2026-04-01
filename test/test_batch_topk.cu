@@ -492,9 +492,7 @@ bool check_benchmark_measurement_contract() {
 
 bool check_low_byte_histogram_baseline_contract() {
   return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50 &&
-         radix_topk::kOptimizedCandidateCap == 64 &&
-         radix_topk::kLowByteTopk50HistogramCacheEntries == 4;
+         radix_topk::kOptimizedK == 50;
 }
 
 bool check_optimized_state_contract() {

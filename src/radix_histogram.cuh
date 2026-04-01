@@ -11,11 +11,7 @@ inline constexpr int kHistogramBlockThreads = 256;
 inline constexpr int kHistogramWarpSize = 32;
 inline constexpr int kHistogramWarpsPerBlock =
     kHistogramBlockThreads / kHistogramWarpSize;
-inline constexpr int kLowByteTopk50HistogramCacheEntries = 4;
 
-// This register cache is only for the optimized single-CTA k=50 low-byte
-// histogram path. It uses unsigned short counts with a fixed small cache, and
-// full-cache eviction currently replaces slot 0.
 struct HistogramCacheEntry {
   unsigned short bin = 0xffffu;
   unsigned short count = 0u;
@@ -139,8 +135,8 @@ __global__ inline void histogram_low_byte_topk50_v2_kernel(
   }
   __syncthreads();
 
-  HistogramCacheEntry cache[kLowByteTopk50HistogramCacheEntries];
-  for (int i = 0; i < kLowByteTopk50HistogramCacheEntries; ++i) {
+  HistogramCacheEntry cache[4];
+  for (int i = 0; i < 4; ++i) {
     cache[i].bin = 0xffffu;
     cache[i].count = 0u;
   }
@@ -150,13 +146,10 @@ __global__ inline void histogram_low_byte_topk50_v2_kernel(
     const uint16_t encoded = encode_half_desc(segment_input[i]);
     if ((encoded >> 8) == state.boundary_digit) {
       accumulate_histogram_cache(
-          cache,
-          kLowByteTopk50HistogramCacheEntries,
-          static_cast<unsigned short>(encoded & 0xffu),
-          warp_histogram);
+          cache, 4, static_cast<unsigned short>(encoded & 0xffu), warp_histogram);
     }
   }
-  flush_histogram_cache(cache, kLowByteTopk50HistogramCacheEntries, warp_histogram);
+  flush_histogram_cache(cache, 4, warp_histogram);
   __syncthreads();
 
   unsigned int* segment_histogram =
