@@ -370,6 +370,15 @@ bool check_benchmark_measurement_contract() {
          radix_topk::kPrimaryBenchmarkCases[4].seg_num == 6000;
 }
 
+bool check_benchmark_repeat_contract() {
+  constexpr auto cases = radix_topk::kPrimaryBenchmarkCases;
+  return cases.size() == 5 &&
+         cases[0].seg_len == 10000 &&
+         cases[0].k == 50 &&
+         cases[4].seg_len == 10000 &&
+         cases[4].k == 50;
+}
+
 bool check_stage_timing_contract() {
   radix_topk::BatchTopkStageTiming timing{};
   return timing.high_byte_hist_us == 0.0f &&
@@ -1410,6 +1419,10 @@ int main() {
   }
   if (!check_benchmark_measurement_contract()) {
     std::fprintf(stderr, "benchmark measurement contract is incorrect\n");
+    return 1;
+  }
+  if (!check_benchmark_repeat_contract()) {
+    std::fprintf(stderr, "benchmark repeat contract is incorrect\n");
     return 1;
   }
   if (!check_stage_timing_contract()) {
