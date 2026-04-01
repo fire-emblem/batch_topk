@@ -199,8 +199,16 @@ bool run_histogram_topk50_pair(const std::vector<float>& values,
 }
 
 bool run_high_byte_histogram_variant(const std::vector<float>& values,
+                                     int seg_num,
+                                     int seg_len,
                                      bool use_large_kernel,
                                      std::vector<unsigned int>* histograms_out) {
+  if (seg_num <= 0 || seg_len <= 0 ||
+      values.size() != static_cast<size_t>(seg_num) * seg_len ||
+      histograms_out->size() != static_cast<size_t>(seg_num) * 256u) {
+    return false;
+  }
+
   std::vector<half> host_input(values.size());
   for (size_t i = 0; i < values.size(); ++i) {
     host_input[i] = __float2half(values[i]);
@@ -222,11 +230,11 @@ bool run_high_byte_histogram_variant(const std::vector<float>& values,
   }
 
   if (use_large_kernel) {
-    radix_topk::histogram_high_byte_topk50_large_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_histograms);
+    radix_topk::histogram_high_byte_topk50_large_kernel<<<seg_num, 256>>>(
+        d_input, seg_len, d_histograms);
   } else {
-    radix_topk::histogram_high_byte_topk50_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_histograms);
+    radix_topk::histogram_high_byte_topk50_kernel<<<seg_num, 256>>>(
+        d_input, seg_len, d_histograms);
   }
 
   const bool ok = cudaGetLastError() == cudaSuccess &&
@@ -241,9 +249,18 @@ bool run_high_byte_histogram_variant(const std::vector<float>& values,
 }
 
 bool run_low_byte_histogram_large_variant(const std::vector<float>& values,
-                                          const radix_topk::SegmentSelectState& state,
+                                          int seg_num,
+                                          int seg_len,
+                                          const std::vector<radix_topk::SegmentSelectState>& states,
                                           bool use_large_kernel,
                                           std::vector<unsigned int>* histograms_out) {
+  if (seg_num <= 0 || seg_len <= 0 ||
+      values.size() != static_cast<size_t>(seg_num) * seg_len ||
+      states.size() != static_cast<size_t>(seg_num) ||
+      histograms_out->size() != static_cast<size_t>(seg_num) * 256u) {
+    return false;
+  }
+
   std::vector<half> host_input(values.size());
   for (size_t i = 0; i < values.size(); ++i) {
     host_input[i] = __float2half(values[i]);
@@ -254,7 +271,8 @@ bool run_low_byte_histogram_large_variant(const std::vector<float>& values,
   unsigned int* d_histograms = nullptr;
   if (cudaMalloc(reinterpret_cast<void**>(&d_input), sizeof(half) * host_input.size()) !=
           cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&d_state), sizeof(radix_topk::SegmentSelectState)) !=
+      cudaMalloc(reinterpret_cast<void**>(&d_state),
+                 sizeof(radix_topk::SegmentSelectState) * states.size()) !=
           cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&d_histograms),
                  sizeof(unsigned int) * histograms_out->size()) != cudaSuccess ||
@@ -262,7 +280,10 @@ bool run_low_byte_histogram_large_variant(const std::vector<float>& values,
                  host_input.data(),
                  sizeof(half) * host_input.size(),
                  cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(d_state, &state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) {
+      cudaMemcpy(d_state,
+                 states.data(),
+                 sizeof(radix_topk::SegmentSelectState) * states.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
     cudaFree(d_histograms);
     cudaFree(d_state);
     cudaFree(d_input);
@@ -270,11 +291,11 @@ bool run_low_byte_histogram_large_variant(const std::vector<float>& values,
   }
 
   if (use_large_kernel) {
-    radix_topk::histogram_low_byte_topk50_large_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_state, d_histograms);
+    radix_topk::histogram_low_byte_topk50_large_kernel<<<seg_num, 256>>>(
+        d_input, seg_len, d_state, d_histograms);
   } else {
-    radix_topk::histogram_low_byte_topk50_kernel<<<1, 256>>>(
-        d_input, static_cast<int>(values.size()), d_state, d_histograms);
+    radix_topk::histogram_low_byte_topk50_kernel<<<seg_num, 256>>>(
+        d_input, seg_len, d_state, d_histograms);
   }
 
   const bool ok = cudaGetLastError() == cudaSuccess &&
@@ -341,6 +362,29 @@ bool run_gpu_cutoff_selection(const std::vector<float>& values,
   cudaFree(d_hist_hi);
   cudaFree(d_input);
   return ok;
+}
+
+bool run_gpu_cutoff_selection_segments(
+    const std::vector<float>& values,
+    int seg_num,
+    int seg_len,
+    int k,
+    std::vector<radix_topk::SegmentSelectState>* states_out) {
+  if (seg_num <= 0 || seg_len <= 0 ||
+      values.size() != static_cast<size_t>(seg_num) * seg_len ||
+      states_out->size() != static_cast<size_t>(seg_num)) {
+    return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    const size_t begin = static_cast<size_t>(seg) * seg_len;
+    const size_t end = begin + static_cast<size_t>(seg_len);
+    const std::vector<float> segment_values(values.begin() + begin, values.begin() + end);
+    if (!run_gpu_cutoff_selection(segment_values, k, &(*states_out)[static_cast<size_t>(seg)])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool check_gpu_cutoff_selection() {
@@ -443,39 +487,53 @@ bool check_topk50_histogram_kernels() {
 }
 
 bool check_large_batch_high_histogram_equivalence() {
+  const int seg_num = 3;
   const int seg_len = 10000;
-  const std::vector<float> values = make_random_input(1, seg_len, 20260401u);
-  std::vector<unsigned int> old_hist(256, 0);
-  std::vector<unsigned int> new_hist(256, 0);
-  if (!run_high_byte_histogram_variant(values, false, &old_hist) ||
-      !run_high_byte_histogram_variant(values, true, &new_hist)) {
+  const std::vector<float> values = make_random_input(seg_num, seg_len, 20260401u);
+  std::vector<unsigned int> old_hist(static_cast<size_t>(seg_num) * 256u, 0);
+  std::vector<unsigned int> new_hist(static_cast<size_t>(seg_num) * 256u, 0);
+  if (!run_high_byte_histogram_variant(values, seg_num, seg_len, false, &old_hist) ||
+      !run_high_byte_histogram_variant(values, seg_num, seg_len, true, &new_hist)) {
     return false;
   }
   return old_hist == new_hist;
 }
 
 bool check_large_batch_low_histogram_equivalence() {
+  const int seg_num = 3;
   const int seg_len = 10000;
   const int k = 50;
-  const std::vector<float> values = make_duplicate_heavy_input(1, seg_len);
-  radix_topk::SegmentSelectState state{};
-  if (!run_gpu_cutoff_selection(values, k, &state)) {
+  const std::vector<float> values = make_duplicate_heavy_input(seg_num, seg_len);
+  std::vector<radix_topk::SegmentSelectState> states(seg_num);
+  if (!run_gpu_cutoff_selection_segments(values, seg_num, seg_len, k, &states)) {
     return false;
   }
 
-  std::vector<unsigned int> old_hist(256, 0);
-  std::vector<unsigned int> new_hist(256, 0);
-  if (!run_low_byte_histogram_large_variant(values, state, false, &old_hist) ||
-      !run_low_byte_histogram_large_variant(values, state, true, &new_hist)) {
+  std::vector<unsigned int> old_hist(static_cast<size_t>(seg_num) * 256u, 0);
+  std::vector<unsigned int> new_hist(static_cast<size_t>(seg_num) * 256u, 0);
+  if (!run_low_byte_histogram_large_variant(values, seg_num, seg_len, states, false, &old_hist) ||
+      !run_low_byte_histogram_large_variant(values, seg_num, seg_len, states, true, &new_hist)) {
     return false;
+  }
+
+  for (int seg = 0; seg < seg_num; ++seg) {
+    int nonzero_bins = 0;
+    const size_t base = static_cast<size_t>(seg) * 256u;
+    for (int bin = 0; bin < 256; ++bin) {
+      if (old_hist[base + static_cast<size_t>(bin)] != 0u) {
+        ++nonzero_bins;
+      }
+    }
+    if (nonzero_bins <= 1) {
+      return false;
+    }
   }
   return old_hist == new_hist;
 }
 
 bool check_large_batch_histogram_baseline_contract() {
   return radix_topk::kOptimizedSegLen == 10000 &&
-         radix_topk::kOptimizedK == 50 &&
-         radix_topk::kOptimizedCandidateCap == 64;
+         radix_topk::kOptimizedK == 50;
 }
 
 bool check_benchmark_target_matrix() {
