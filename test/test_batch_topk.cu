@@ -113,6 +113,87 @@ bool run_histogram_pass(const std::vector<float>& values,
   return ok;
 }
 
+bool run_histogram_topk50_pair(const std::vector<float>& values,
+                               int k,
+                               std::vector<unsigned int>* histograms_hi,
+                               std::vector<unsigned int>* histograms_lo,
+                               radix_topk::SegmentSelectState* state_out) {
+  std::vector<half> host_input(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    host_input[i] = __float2half(values[i]);
+  }
+
+  half* d_input = nullptr;
+  unsigned int* d_histograms_hi = nullptr;
+  unsigned int* d_histograms_lo = nullptr;
+  radix_topk::SegmentSelectState* d_state = nullptr;
+  if (cudaMalloc(reinterpret_cast<void**>(&d_input),
+                 sizeof(half) * host_input.size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_histograms_hi),
+                 sizeof(unsigned int) * histograms_hi->size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_histograms_lo),
+                 sizeof(unsigned int) * histograms_lo->size()) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&d_state),
+                 sizeof(radix_topk::SegmentSelectState)) != cudaSuccess ||
+      cudaMemcpy(d_input,
+                 host_input.data(),
+                 sizeof(half) * host_input.size(),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(d_state);
+    cudaFree(d_histograms_lo);
+    cudaFree(d_histograms_hi);
+    cudaFree(d_input);
+    return false;
+  }
+
+  radix_topk::histogram_high_byte_topk50_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), d_histograms_hi);
+  if (cudaGetLastError() != cudaSuccess) {
+    cudaFree(d_state);
+    cudaFree(d_histograms_lo);
+    cudaFree(d_histograms_hi);
+    cudaFree(d_input);
+    return false;
+  }
+  radix_topk::select_high_byte_boundary_kernel<<<1, 128>>>(d_histograms_hi, 1, k, d_state);
+  if (cudaGetLastError() != cudaSuccess) {
+    cudaFree(d_state);
+    cudaFree(d_histograms_lo);
+    cudaFree(d_histograms_hi);
+    cudaFree(d_input);
+    return false;
+  }
+  radix_topk::histogram_low_byte_topk50_kernel<<<1, 256>>>(
+      d_input, static_cast<int>(values.size()), d_state, d_histograms_lo);
+  if (cudaGetLastError() != cudaSuccess) {
+    cudaFree(d_state);
+    cudaFree(d_histograms_lo);
+    cudaFree(d_histograms_hi);
+    cudaFree(d_input);
+    return false;
+  }
+  radix_topk::finalize_cutoff_key_kernel<<<1, 128>>>(d_histograms_lo, 1, k, d_state);
+  const bool ok =
+      cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
+      cudaMemcpy(histograms_hi->data(),
+                 d_histograms_hi,
+                 sizeof(unsigned int) * histograms_hi->size(),
+                 cudaMemcpyDeviceToHost) == cudaSuccess &&
+      cudaMemcpy(histograms_lo->data(),
+                 d_histograms_lo,
+                 sizeof(unsigned int) * histograms_lo->size(),
+                 cudaMemcpyDeviceToHost) == cudaSuccess &&
+      cudaMemcpy(state_out,
+                 d_state,
+                 sizeof(*state_out),
+                 cudaMemcpyDeviceToHost) == cudaSuccess;
+  cudaFree(d_state);
+  cudaFree(d_histograms_lo);
+  cudaFree(d_histograms_hi);
+  cudaFree(d_input);
+  return ok;
+}
+
 bool run_gpu_cutoff_selection(const std::vector<float>& values,
                               int k,
                               radix_topk::SegmentSelectState* state_out) {
@@ -228,6 +309,38 @@ bool check_histogram_pass() {
   }
   for (int i = 0; i < 255; ++i) {
     if (filtered_histograms[static_cast<size_t>(i)] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool check_topk50_histogram_kernels() {
+  const std::vector<float> values = {9.0f, 8.0f, 7.0f, 6.0f,
+                                     5.0f, 4.0f, 3.0f, 2.0f};
+  std::vector<unsigned int> histograms_hi(256, 0);
+  std::vector<unsigned int> histograms_lo(256, 0);
+  radix_topk::SegmentSelectState state{};
+  if (!run_histogram_topk50_pair(values, 3, &histograms_hi, &histograms_lo, &state)) {
+    return false;
+  }
+
+  if (histograms_hi[55] != 2 || histograms_hi[56] != 1 || histograms_hi[57] != 1 ||
+      histograms_hi[58] != 1 || histograms_hi[59] != 1 || histograms_hi[61] != 1 ||
+      histograms_hi[63] != 1) {
+    return false;
+  }
+
+  if (state.boundary_digit != 56 || state.cutoff_key != 0x38ffu ||
+      state.strictly_better_count != 2 || state.remaining_slots != 1) {
+    return false;
+  }
+
+  if (histograms_lo[255] != 1) {
+    return false;
+  }
+  for (int i = 0; i < 255; ++i) {
+    if (histograms_lo[static_cast<size_t>(i)] != 0) {
       return false;
     }
   }
@@ -1274,6 +1387,10 @@ int main() {
   }
   if (!check_histogram_pass()) {
     std::fprintf(stderr, "histogram pass check failed\n");
+    return 1;
+  }
+  if (!check_topk50_histogram_kernels()) {
+    std::fprintf(stderr, "topk50 histogram kernel check failed\n");
     return 1;
   }
   if (!check_benchmark_target_matrix()) {
