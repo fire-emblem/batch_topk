@@ -12,6 +12,7 @@
 namespace radix_topk {
 
 static thread_local BatchTopkStageTiming* g_stage_timing_sink = nullptr;
+inline constexpr int kLargeBatchHistogramThreshold = 1500;
 
 void set_batch_topk_stage_timing_sink(BatchTopkStageTiming* sink) {
   g_stage_timing_sink = sink;
@@ -132,7 +133,9 @@ cudaError_t batch_topk_half(const half* d_input,
 
   if (seg_len == kOptimizedSegLen && k == kOptimizedK) {
     const int ctas_per_segment = histogram_ctas_per_segment(seg_num);
-    const bool use_large_batch_hist = seg_num >= 1500;
+    // Performance-only routing heuristic for the single-CTA histogram path; it
+    // does not affect result semantics.
+    const bool use_large_batch_hist = seg_num >= kLargeBatchHistogramThreshold;
     if (ctas_per_segment < 1 ||
         ctas_per_segment > kPartialHistogramMaxCtasPerSegment) {
       // partial_histograms is provisioned for at most 4 split CTAs per segment.
